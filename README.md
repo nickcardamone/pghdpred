@@ -127,18 +127,6 @@ The synthetic dataset supports:
 4. **Control group analysis**: Random time windows for patients without events
 5. **Missing data handling**: Realistic device availability patterns
 
-## Usage
-
-```r
-# Load the synthetic dataset
-source("3B.1- Synthetic Dataset.R")
-
-# The script generates:
-# - synthetic_daily: Daily-level dataset
-# - Two publication-ready plots showing step patterns around clinical events
-# - Summary statistics and validation outputs
-```
-
 ## Output
 
 The script produces:
@@ -157,16 +145,6 @@ The script produces:
 - Device ownership patterns
 - Sample sizes by analysis group
 - Data quality metrics
-
-## Research Applications
-
-This synthetic dataset enables researchers to:
-
-- **Develop analytical methods** without accessing real patient data
-- **Create publication-ready visualizations** demonstrating healthcare analytics
-- **Test device prioritization algorithms** with realistic multi-device scenarios  
-- **Validate event-based analysis approaches** with known declining patterns
-- **Share reproducible examples** of patient-generated health data analysis
 
 ---
 

@@ -1,151 +1,143 @@
-# pghdpred
-Using patient generated health data to improve a hospitalization and mortality model
+# OPS_Bressman-PGHDPred Project
 
-The following charts are generated with synthetic data based on the structure and dynamics of the real data.
+## Project Overview
+This quality improvement project, funded through the **VA Office of Connected Care**, leverages increasingly available patient-generated health data (PGHD) from wearable and smart devices to make more accurate and precise predictions of Veteran hospitalization and mortality. The analysis period spans **January 1, 2022 to September 25, 2025**, with outcomes tracked through **October 24, 2025**.
 
-<img width="1008" height="805" alt="image" src="https://github.com/user-attachments/assets/708d0199-1fa7-4768-b4f3-108957f5148b" />
+## Project Objective
+Take advantage of patient-generated health data (via wearable and smart devices) to make more accurate and precise predictions of Veteran hospitalization and mortality.
 
-<img width="1008" height="805" alt="image" src="https://github.com/user-attachments/assets/2ebc43ba-ec00-46c1-bed5-c7714358cb8a" />
+## Project Structure
 
-## Synthetic Dataset Generator
+### 01_R_Scripts/
+R scripts implementing the complete data pipeline:
 
-This R script (`3B.1- Synthetic Dataset.R`) generates synthetic patient data that mimics the structure and patterns of real patient-generated health data (PGHD) for research and visualization purposes. The synthetic data maintains the same analytical patterns as real data while being completely artificial and safe for sharing.
+#### **Step 1A: Generate Cohort**
+- Extract all individuals with PGHD data from `DOEx.GENERIC_PGHD`
+- Categories: "Sleep", "Workout", and "Daily Activity Summary"
+- Extract and clean 48 PGHD features
+- Expand dataset to include all days in analysis period for each person
+- Create person-level summary data (first upload date, lookback periods)
+- Calculate meteorological season using `season()` function from traumar package
 
-### Overview
+#### **Step 2A: Demographics**
+- **Data Sources**: OMOP Person View, Spatient.Spatient, Spatient.Address, Veteran.ADRPerson, MVIPerson, OMOP.Death
+- **Features Extracted**:
+  - Gender, Race, Ethnicity
+  - Marital status (at or before first upload date)
+  - GIS-URH rurality indicator (based on address)
+  - VA Priority Group enrollment status
+  - Date of death (outcome variable)
+  - Age (calculated from birthdate and first upload date)
 
-The synthetic dataset simulates:
-- **1,000 patients** with realistic observation periods
-- **Multiple device types** (Apple Health, Fitbit, Garmin)
-- **Clinical events** (ED visits, inpatient stays, deaths)
-- **Declining step patterns** leading up to clinical events
-- **Device prioritization** logic for analysis
+#### **Step 2B: Health Care Utilization**
+- **Data Sources**: Outpat.Workload, Inpat.Inpatient, IVC_CDS.CDS_Claim_Header, Appt.Appointment
+- **Features Extracted**:
+  - Prior year/two years: ED visits, urgent care visits, inpatient stays
+  - Inpatient categorization using SpecialtyIEN and PTF Codes (HERC methodology):
+    - Med/Surgery, Mental Health, Nursing Home, etc.
+  - Community Care visits and length of stay (prior year)
+  - No-show appointments (prior year)
+- **Outcomes Generated**:
+  - Person-level prior healthcare utilization
+  - Person-day level ED visits during analytic window
+  - Person-day level inpatient stays during analytic window
 
-### Key Features
+#### **Step 2C: Medical Conditions**
+- **Data Sources**: OMOP Visit Occurrence
+- **Features Extracted**:
+  - 17 conditions from CAN model (prior two years)
+  - Multimorbidity Weighted Index (MWI) using Wei et al. 2024 methodology
+  - ICD10/CPT code matching for condition identification
+- **Output**: Person-level prior medical conditions (parquet)
 
-#### Event Distribution
-- **30%** of patients have ED visits
-- **10%** of patients have inpatient stays  
-- **1%** of patients die
-- **~40%** of deaths occur without prior ED/inpatient visits (realistic healthcare patterns)
+#### **Step 2D: Vital Signs and Labs**
+- **Data Sources**: OMOP Measurement
+- **Vital Signs** (prior 5 years):
+  - BMI (from static height + most recent weight)
+  - Mean Arterial Pressure (from systolic/diastolic BP)
+  - Heart rate/Pulse (most recent prior year)
+  - Five-year spline trajectories for BMI and MAP
+- **Laboratory Values** (prior year):
+  - Blood Urea Nitrogen (BUN)
+  - Albumin
+  - White Blood Cell count (Leukocytes)
+  - LOINC codes from OMOP Cipher webpage
+  - Unit standardization, outlier removal, prior-year trajectories
+- **Technical Notes**: 
+  - Natural splines require ≥3 day-level data points
+  - Multiple same-day measurements averaged
+  - Uses `ns()` from splines package
 
-#### Device Ownership Model
-- **60%** Apple Health only
-- **30%** Fitbit/Garmin only
-- **10%** Both device types
-- Device prioritization: Fitbit/Garmin preferred over Apple when both available
+#### **Step 2E: Tobacco Use and Military Sexual Trauma**
+- **Data Sources**: HF.HealthFactor, PatSub.MilitarySexualTrauma
+- **Features Extracted**:
+  - Smoking status (prior 5 years) using VACS lookup table
+  - Most recent smoking categorization
+  - MST status (any affirmation = yes)
 
-#### Temporal Patterns
-- **Declining step activity** in the 10 weeks leading up to clinical events
-- **Weekend effects** (20% reduction in weekend activity)
-- **Event timing**: ED visits → Inpatient stays → Deaths (when multiple events occur)
+#### **Step 3A: Visualization and Analysis**
+- Analytical models and visualizations
 
-## Data Dictionary: `synthetic_daily` Dataset
+#### **Step 3B: Create Synthetic Data**
+- Generate fake data based on aggregated features of real data
 
-### Patient Identifiers
-| Variable | Type | Description |
-|----------|------|-------------|
-| `pat_id` | character | Synthetic patient identifier (PAT_0001, PAT_0002, etc.) |
+### 02_SQL_Scripts/
+SQL queries for data extraction from protected databases
 
-### Observation Periods
-| Variable | Type | Description |
-|----------|------|-------------|
-| `date_first` | Date | First date of patient observation/enrollment |
-| `obs_duration` | integer | Length of observation period in days (200-400 days) |
-| `date_last` | Date | Last date of patient data collection |
-| `obs_end` | Date | End of observation window (includes follow-up period) |
-| `date` | Date | Daily observation date |
+### 03_Documentation/
+- Meeting notes and project planning
+- Data codebook and variable specifications
+- Research protocols and methodologies
 
-### Event Flags
-| Variable | Type | Description |
-|----------|------|-------------|
-| `has_ed_visit` | logical | Patient had an ED visit during observation |
-| `has_inpatient` | logical | Patient had an inpatient stay during observation |
-| `has_death` | logical | Patient died during observation |
-| `event_type` | character | Primary event type: "ed_visit", "inpatient", "death", "no_event" |
-| `has_event` | logical | Patient had any clinical event (TRUE/FALSE) |
+### 04_Data_Connection/
+- Health factor lookup tables (VACS smoking status)
+- Database connection parameters
 
-### Event Timing
-| Variable | Type | Description |
-|----------|------|-------------|
-| `ed_visit_date` | numeric | Date of ED visit (days since 1970-01-01) |
-| `inpatient_date` | numeric | Date of inpatient admission (days since 1970-01-01) |
-| `death_date` | numeric | Date of death (days since 1970-01-01) |
-| `event_date` | Date | Date of primary clinical event |
+### parquet/
+Processed datasets stored in efficient parquet format
 
-### Device Information
-| Variable | Type | Description |
-|----------|------|-------------|
-| `device_profile` | character | Device ownership: "apple_only", "fit_garmin_only", "both" |
-| `has_apple` | logical | Patient owns Apple Health device |
-| `has_fit_garmin` | logical | Patient owns Fitbit or Garmin device |
-| `primary_device` | character | Primary device when multiple owned: "apple", "fit_garmin" |
+## Key Datasets Generated
 
-### Step Data
-| Variable | Type | Description |
-|----------|------|-------------|
-| `ah_das_exercise_steps` | numeric | Daily steps from Apple Health (0 if no Apple device) |
-| `fit_das_exercise_steps` | numeric | Daily steps from Fitbit (0 if no Fitbit device) |
-| `gar_das_exercise_steps` | numeric | Daily steps from Garmin (0 if no Garmin device) |
+| Dataset | Description | Level | Key Variables |
+|---------|-------------|-------|---------------|
+| **cohort_static** | Person-level baseline characteristics | Person | Demographics, prior conditions, vital trajectories, MWI score |
+| **cohort_daily** | Person-day observations | Person-Day | PGHD features (steps, sleep, workouts), outcomes (ED, inpatient, death) |
+| **pghd_features** | Cleaned PGHD measurements | Person-Day-Measurement | 48 features across Sleep, Workout, Activity categories |
 
-### Synthetic Generation Variables
-| Variable | Type | Description |
-|----------|------|-------------|
-| `base_steps` | numeric | Individual baseline step count (used for generation) |
-| `day_of_week_factor` | numeric | Weekend reduction factor (0.8 weekends, 1.0 weekdays) |
-| `days_to_event` | numeric | Days until clinical event (NA for no-event patients) |
-| `event_decline_factor` | numeric | Step reduction factor as event approaches |
+## PGHD Features (48 Total)
+- **Daily Activity Summary**: Steps, distance, active energy, exercise time, stand hours, etc.
+- **Sleep**: Total sleep, REM, deep, core, awake time, heart rate metrics
+- **Workout**: Duration, energy burned, average/max heart rate, distance
 
-### Daily Event Indicators
-| Variable | Type | Description |
-|----------|------|-------------|
-| `ed` | numeric | ED visit occurred on this date (1/0) |
-| `inpat_any` | numeric | Inpatient admission occurred on this date (1/0) |
-| `dod` | character | Date of death (if occurred on this date) |
+## Outcomes Tracked
+1. **Emergency Department Visits** (person-day level during analysis window)
+2. **Inpatient Hospitalizations** (person-day level during analysis window)
+3. **Mortality** (date of death from OMOP.Death)
 
-### Additional Health Data
-| Variable | Type | Description |
-|----------|------|-------------|
-| `ah_sleep_TOTAL_sec` | numeric | Total sleep duration in seconds (Apple Health) |
-| `ah_wo_avgHR_bpm` | numeric | Average heart rate in beats per minute (Apple Health) |
-| `data_day` | numeric | Indicator for days with any device data (1/0) |
+## Analysis Period
+- **Cohort Definition**: January 1, 2022 - September 25, 2025
+- **Outcome Tracking**: Through October 24, 2025
+- **Observation Windows**: Extend 30 days after last upload date per person
 
-## Dataset Characteristics
+## Security and Compliance
+- **Protected Data Environment**: All analysis conducted behind VA firewall
+- **HIPAA Compliance**: Adherence to VA data security requirements
+- **Synthetic Data**: Generated for external sharing and validation
 
-- **Total Records**: ~298,531 daily observations
-- **Patients**: 1,000 synthetic patients
-- **Time Range**: 2022-2024 (realistic enrollment dates)
-- **Missing Data**: Realistic patterns of device availability and data gaps
-- **Event Patterns**: Declining step activity 70 days before clinical events
+## Data Sources
+- **DOEx.GENERIC_PGHD**: Patient-generated health data repository
+- **OMOP CDM**: Person, Death, Measurement, Visit Occurrence
+- **VA CDW**: Outpat.Workload, Inpat.Inpatient, Spatient, Veteran tables
+- **Community Care**: IVC_CDS claims data
+- **Clinical Data**: HF.HealthFactor, PatSub.MilitarySexualTrauma
 
-## Analysis Capabilities
+## Collaboration
+- **VA Office of Connected Care**: Project funding and support
+- **OCC PGHD ML Group**: Machine learning methodology
+- **Bressman Research Team**: Clinical research leadership
+- **Health Economic Resource Center (HERC)**: Inpatient categorization methodology
 
-The synthetic dataset supports:
-
-1. **Event-based analysis**: Step patterns leading up to clinical events
-2. **Device comparison**: Apple Health vs. Fitbit/Garmin performance
-3. **Temporal analysis**: Weekly and daily activity patterns
-4. **Control group analysis**: Random time windows for patients without events
-5. **Missing data handling**: Realistic device availability patterns
-
-## Output
-
-The script produces:
-
-### Generated Datasets
-- `synthetic_daily`: Primary daily-level dataset with all variables
-- `steps_weekly_events`: Weekly aggregated data for event analysis
-- `first_events`: Patient-level event summary
-
-### Visualizations
-1. **Main Event Plot**: Weekly step counts leading to clinical events (-10 to 0 weeks)
-2. **Device Comparison Plot**: Step patterns by device type and event, faceted by event type
-
-### Summary Statistics
-- Event distribution validation
-- Device ownership patterns
-- Sample sizes by analysis group
-- Data quality metrics
-
----
-
-*This synthetic dataset is completely artificial and contains no real patient information. All patterns and relationships are algorithmically generated to mimic real-world healthcare data dynamics.*
+## Technical Environment
+- **Language**: R (tidyverse, arrow, data.table, splines)
+- **Storage**: Parquet format for efficient large-scale data
+- **Development**: VS Code with secure VA network access

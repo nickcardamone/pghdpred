@@ -119,11 +119,6 @@ Processed datasets stored in efficient parquet format
 - **Outcome Tracking**: Through October 24, 2025
 - **Observation Windows**: Extend 30 days after last upload date per person
 
-## Security and Compliance
-- **Protected Data Environment**: All analysis conducted behind VA firewall
-- **HIPAA Compliance**: Adherence to VA data security requirements
-- **Synthetic Data**: Generated for external sharing and validation
-
 ## Data Sources
 - **DOEx.GENERIC_PGHD**: Patient-generated health data repository
 - **OMOP CDM**: Person, Death, Measurement, Visit Occurrence
@@ -133,11 +128,7 @@ Processed datasets stored in efficient parquet format
 
 ## Collaboration
 - **VA Office of Connected Care**: Project funding and support
-- **OCC PGHD ML Group**: Machine learning methodology
-- **Bressman Research Team**: Clinical research leadership
-- **Health Economic Resource Center (HERC)**: Inpatient categorization methodology
 
 ## Technical Environment
 - **Language**: R (tidyverse, arrow, data.table, splines)
 - **Storage**: Parquet format for efficient large-scale data
-- **Development**: VS Code with secure VA network access

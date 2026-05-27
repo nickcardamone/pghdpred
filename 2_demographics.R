@@ -2,7 +2,7 @@
 ### 2A. Socio-demographics Gender, Race, Ethnicity (OMOP CDW), Marital Status (SPatient) and Rurality (SPatient Address), VA Enrollment Group. 
 ### OCC_PGHDPred
 ### Date created: 4/28/2025
-### Last updated: 10/23/2025
+### Last updated: 5/15/2026
 
 suppressPackageStartupMessages({
   library(DBI) # Working with data in databases
@@ -24,6 +24,11 @@ suppressPackageStartupMessages({
   library(table1)
 })
 
+
+setwd(
+  "C://Users//VHAPHICardaN//OneDrive - Department of Veterans Affairs//Desktop//Projects//OPS_Bressman-PGHDPred//pghdpred_deliverable"
+)
+
 '%!in%' <- function(x, y)
   ! ('%in%'(x, y))
 
@@ -31,6 +36,7 @@ suppressPackageStartupMessages({
 con <- dbConnect(odbc::odbc(),
                  .connection_string = "Driver={SQL Server};Server=vhacdwrb03.vha.med.va.gov;Trusted_Connection=yes;",
                  timeout = 10)
+
 # Connect to specific databases using ODBC
 cdwwork <- dbConnect(
   odbc::odbc(),
@@ -48,7 +54,7 @@ db_pghpred <- dbConnect(
 
 # ---------------------------------------------------------------------------
 # 1) Load PGHD cohort: 
-cohort = open_dataset('parquet\\pghd_final_full_visits_ids.parquet') %>% collect()
+cohort = open_dataset('data\\pghd_final_full_visits_ids.parquet') %>% collect() %>% na.omit()
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -61,8 +67,9 @@ omop_concept <- tbl(cdwwork, in_schema('OMOPV5', 'CONCEPT')) %>%
 # 3) OMOP Person (CDW): Gender, Race, Ethnicity
 # ---------------------------------------------------------------------------
 omop_xw <- tbl(cdwwork, in_schema('OMOPV5Map', 'SPatient_PERSON')) %>%
-  inner_join(cohort, by = "PatientICN", copy = TRUE) %>%
-  select(PatientICN, PERSON_ID, date_first) %>% distinct()
+  inner_join(cohort, by = "PatientICN", copy = T) %>%
+  select(PatientICN, PERSON_ID, date_first) %>% 
+  distinct()
 
 omop_person_cdw <- tbl(cdwwork, in_schema('OMOPV5', 'PERSON')) %>%
   inner_join(omop_xw, by = "PERSON_ID") %>%
@@ -93,7 +100,7 @@ omop_person_cdw <- tbl(cdwwork, in_schema('OMOPV5', 'PERSON')) %>%
 # ---------------------------------------------------------------------------
 
 cohort_sid <- tbl(cdwwork, in_schema('SPatient', 'SPatient')) %>%
-  inner_join(cohort, by = "PatientICN", copy = TRUE) %>%
+  inner_join(cohort, by = "PatientICN", copy = T) %>%
   transmute(PatientICN, PatientSID, date_first, MaritalStatus_date = as.Date(PatientEnteredDateTime), MaritalStatus)
 
 marital_spatient <- cohort_sid  %>% 
@@ -110,25 +117,31 @@ marital_spatient <- cohort_sid  %>%
 marital_spatient <- marital_spatient %>%
   mutate(days_from = ymd(MaritalStatus_date) - ymd(date_first))
 
-marital_outpat_visit <- tbl(cdwwork, in_schema('Outpat', 'Visit')) %>% 
-  transmute(PatientSID, 
-            MaritalStatus_date = as.Date(VisitDateTime),
-            PatientMaritalStatus) %>% 
-  filter(PatientMaritalStatus %in% c('W', 'M', 'D', 'S', 'N')) %>%
+# Pre-collect cohort SIDs to avoid double-execution from joining a lazy tbl with copy=T
+cohort_sid_r <- cohort_sid %>%
+  select(PatientICN, PatientSID, date_first) %>%
   distinct() %>%
-  inner_join(cohort_sid %>% select(PatientICN, PatientSID, date_first) %>% distinct(), "PatientSID", copy = T) %>% 
+  collect()
+
+marital_outpat_visit <- tbl(cdwwork, in_schema('Outpat', 'Visit')) %>%
+  filter(VisitDateTime >= '2018-01-01',
+         PatientMaritalStatus %in% c('W', 'M', 'D', 'S', 'N')) %>%
+  transmute(PatientSID,
+            MaritalStatus_date = as.Date(VisitDateTime),
+            PatientMaritalStatus) %>%
+  inner_join(cohort_sid_r, by = "PatientSID", copy = TRUE) %>%
   transmute(PatientICN,
             date_first,
             MaritalStatus_date,
             Married = if_else(PatientMaritalStatus == 'M', 1, 0),
-            MaritalStatus = if_else(PatientMaritalStatus == "W", "WIDOWED", PatientMaritalStatus),
-            MaritalStatus = if_else(MaritalStatus == "M", "MARRIED", MaritalStatus),
-            MaritalStatus = if_else(MaritalStatus == "N", "NEVER MARRIED", MaritalStatus),
-            MaritalStatus = if_else(MaritalStatus == "S", "SEPARATED", MaritalStatus),
-            MaritalStatus = if_else(MaritalStatus == "D", "DIVORCED", MaritalStatus)) %>% 
-  collect() 
-
-marital_outpat_visit <- marital_outpat_visit %>%
+            MaritalStatus = case_when(
+              PatientMaritalStatus == "W" ~ "WIDOWED",
+              PatientMaritalStatus == "M" ~ "MARRIED",
+              PatientMaritalStatus == "N" ~ "NEVER MARRIED",
+              PatientMaritalStatus == "S" ~ "SEPARATED",
+              PatientMaritalStatus == "D" ~ "DIVORCED"
+            )) %>%
+  collect() %>%
   mutate(days_from = ymd(MaritalStatus_date) - ymd(date_first))
 
 # Join marital status info from SPatient and Outpat.Visit tables:
@@ -228,8 +241,7 @@ xw_icn_adr <- tbl(cdwwork, in_schema('Veteran', 'ADRPerson')) %>%
   filter(ICNStatusCode %in% c('P', 'T')) %>%
   select(PatientICN = ADRPersonICN, ADRPersonSID) %>%
   inner_join(cohort, by = "PatientICN", copy = T) %>%
-  select(PatientICN, 
-         date_first, one_years_prior_date, ADRPersonSID) %>%
+  select(PatientICN, date_first, one_years_prior_date, ADRPersonSID) %>%
   distinct()
 
 ADREnrollmentStatus <- tbl(cdwwork, in_schema("NDim", "ADREnrollStatus"))
@@ -237,8 +249,8 @@ ADRPriorityGroup <- tbl(cdwwork, in_schema("NDim", "ADRPriorityGroup"))
 
 pat_enrollment <- tbl(cdwwork, in_schema("ADR", "ADREnrollHistory")) %>% 
   select(ADRPersonSID, ADREnrollStatusSID, ADRPrioritySubGroupSID, ADRPriorityGroupSID, EnrollStartDate, EnrollEndDate, RecordModifiedDate, NextRecordModifiedDate) %>%
-  left_join(ADREnrollmentStatus %>% select(ADREnrollStatusSID, EnrollStatusName, EnrollCategoryName), by = "ADREnrollStatusSID", copy=T) %>% 
-  left_join(ADRPriorityGroup %>% select(ADRPriorityGroupSID, PriorityGroupCode, PriorityGroupName), by = "ADRPriorityGroupSID", copy=T) %>% 
+  left_join(ADREnrollmentStatus %>% select(ADREnrollStatusSID, EnrollStatusName, EnrollCategoryName), by = "ADREnrollStatusSID", copy = T) %>% 
+  left_join(ADRPriorityGroup %>% select(ADRPriorityGroupSID, PriorityGroupCode, PriorityGroupName), by = "ADRPriorityGroupSID", copy = T) %>% 
   filter(EnrollStatusName == "Verified" & EnrollCategoryName == "Enrolled") %>%
   inner_join(xw_icn_adr, "ADRPersonSID") %>% 
   select(PatientICN, date_first, one_years_prior_date, EnrollStatusName, EnrollCategoryName, ADRPriorityGroupSID, ADRPrioritySubGroupSID, PriorityGroupCode, PriorityGroupName, EnrollStartDate, EnrollEndDate, RecordModifiedDate, NextRecordModifiedDate) %>%
@@ -259,7 +271,6 @@ pat_enrollment_fin <- pat_enrollment %>%
           desc(coalesce(as.Date(NextRecordModifiedDate), as.Date("2100-12-31")))) %>%
   mutate(MostRecentStatusChangeRecord = row_number()) %>%
   ungroup()
-
 
 pat_enrollment_fin <- pat_enrollment_fin %>%
   filter(MostRecentStatusChangeRecord == 1) 
@@ -304,7 +315,5 @@ cohort_full_demo <- demo_cohort %>%
 
 # Save to parquet
 cohort_full_demo %>% write_parquet(
-  "parquet\\cohort_full_demo.parquet"
+  "data//input//cohort_full_demo.parquet"
 )
-
-

@@ -1,8 +1,8 @@
 ### Nick Cardamone
 ### OCC_PGHDPred
-### 3. Vital signs and anthropometric measurements
+### 5. Vital signs and anthropometric measurements
 ### Date created: 4/29/2025
-### Last updated: 10/22/2025
+### Last updated: 5/15/2026
 
 # Features of interest for modeling (all within timeframes specified below):
 
@@ -62,15 +62,33 @@ db_pghpred <- dbConnect(odbc::odbc(),
 # ---------------------------------------------------------------------------
 
 # Set working directory
-setwd("C:\\Users\\VHAPHICardaN\\OneDrive - Department of Veterans Affairs\\Desktop\\Projects\\OPS_Bressman-PGHDPred\\")
+
+setwd(
+  "C://Users//VHAPHICardaN//OneDrive - Department of Veterans Affairs//Desktop//Projects//OPS_Bressman-PGHDPred//pghdpred_deliverable"
+)
 
 # Cohort: contains PatientICN and upload window variables (e.g. date_first)
-cohort <- open_dataset('parquet\\pghd_final_full_visits_ids.parquet') %>%
-  collect()
+cohort = open_dataset('data\\pghd_final_full_visits_ids.parquet') %>% collect() %>% na.omit()
+
+# ---------------------------------------------------------------------------
+# M2 anchor: load index events for patients with qualifying ED/IP event
+# ---------------------------------------------------------------------------
+index_events_m2 <- open_dataset('data\\index_event_prelim.parquet') %>%
+  collect() %>%
+  filter(!is.na(index_date)) %>%
+  select(PatientICN, index_date) %>%
+  mutate(index_date = as.Date(index_date))
+
+cohort_m2 <- cohort %>%
+  filter(as.Date(date_first) >= as.Date("2023-06-01")) %>%
+  inner_join(index_events_m2, by = "PatientICN")
+
+global_pull_end <- max(cohort_m2$index_date, na.rm = TRUE)
+cat("M2 cohort:", nrow(cohort_m2), "patients; pull end:", as.character(global_pull_end), "\n")
 
 # Map PatientICN -> PERSON_ID for OMOP joins
-omop_xw <- tbl(cdwwork, in_schema('OMOPV5Map', 'SPatient_PERSON')) %>% 
-  inner_join(cohort, by = "PatientICN", copy = TRUE) %>% 
+omop_xw <- tbl(cdwwork, in_schema('OMOPV5Map', 'SPatient_PERSON')) %>%
+  inner_join(cohort, by = "PatientICN", copy = TRUE) %>%
   select(PatientICN, PERSON_ID, date_first, one_years_prior_date, two_years_prior_date, five_years_prior_date) %>%
   distinct()
 
@@ -80,11 +98,13 @@ omop_xw <- tbl(cdwwork, in_schema('OMOPV5Map', 'SPatient_PERSON')) %>%
 
 # Define OMOP concept IDs for vital signs based on standard mappings
 vital_concepts <- list(
-  weight = c(3013762, 3003176, 3025315, 3023166, 3026600),  # Body weight concepts
-  height = c(3023540, 3019171, 3036277),  # Body height concepts  
-  systolic_bp = c(3004249, 3018586, 3028737),  # Systolic blood pressure
-  diastolic_bp = c(3012888, 3034703, 3019962),  # Diastolic blood pressure
-  heart_rate = c(3027018, 3027598, 3018567),  # Heart rate/pulse
+  weight       = c(3013762, 3003176, 3025315, 3023166, 3026600),  # Body weight concepts
+  height       = c(3023540, 3019171, 3036277),                    # Body height concepts
+  systolic_bp  = c(3004249, 3018586, 3028737),                    # Systolic blood pressure
+  diastolic_bp = c(3012888, 3034703, 3019962),                    # Diastolic blood pressure
+  heart_rate   = c(3027018, 3027598, 3018567),                    # Heart rate/pulse
+  spo2         = c(40762499L, 3016335L),                          # Oxygen saturation by pulse oximetry
+  temperature  = c(3020891L, 36031613L)                           # Body temperature (oral, axillary)
 )
 
 # Get OMOP concept metadata
@@ -93,12 +113,13 @@ omop_concept <- tbl(cdwwork, in_schema('OMOPV5', 'CONCEPT')) %>%
   select(CONCEPT_ID, CONCEPT_NAME, DOMAIN_ID) %>%
   collect()
 
-# Extract vital signs measurements for cohort (prior 5 years lookback)
-omop_vitals <- tbl(cdwwork, in_schema('OMOPV5', 'MEASUREMENT')) %>% 
-  inner_join(omop_xw, by = "PERSON_ID") %>% 
+# Extract vital signs measurements — broad scalar pull; per-patient anchor applied in R
+# days_before_index >= 0 inside processing functions filters to M1 (date_first) automatically.
+omop_vitals <- tbl(cdwwork, in_schema('OMOPV5', 'MEASUREMENT')) %>%
+  inner_join(omop_xw, by = "PERSON_ID") %>%
   filter(MEASUREMENT_CONCEPT_ID %in% !!unlist(vital_concepts)) %>%
-  filter(MEASUREMENT_DATE >= five_years_prior_date & MEASUREMENT_DATE <= date_first) %>%  # 5 years prior
-  select(PatientICN, PERSON_ID, MEASUREMENT_CONCEPT_ID, MEASUREMENT_DATE, 
+  filter(MEASUREMENT_DATE >= '2018-01-01' & MEASUREMENT_DATE <= !!as.character(global_pull_end)) %>%
+  select(PatientICN, PERSON_ID, MEASUREMENT_CONCEPT_ID, MEASUREMENT_DATE,
          VALUE_AS_NUMBER, UNIT_CONCEPT_ID, UNIT_SOURCE_VALUE, date_first) %>%
   collect()
 
@@ -107,7 +128,14 @@ omop_vitals <- omop_vitals %>%
   left_join(omop_concept, by = c("MEASUREMENT_CONCEPT_ID" = "CONCEPT_ID"))
 
 # Save raw vitals data
-write_parquet(omop_vitals, 'parquet/omop_vitals_raw.parquet')
+write_parquet(omop_vitals, 'data\\omop_vitals_raw.parquet')
+
+# M2 vitals: replace date_first with index_date so all processing functions use index_date as anchor
+omop_vitals_m2 <- omop_vitals %>%
+  inner_join(cohort_m2 %>% select(PatientICN, index_date), by = "PatientICN") %>%
+  mutate(date_first = index_date)  # override anchor; days_before_index computed off this
+
+cat("M2 vitals rows:", nrow(omop_vitals_m2), "\n")
 # ---------------------------------------------------------------------------
 # 3) Process weight measurements and calculate BMI
 # ---------------------------------------------------------------------------
@@ -191,7 +219,7 @@ height_processed <- process_height(omop_vitals)
 bmi_calculated <- calculate_bmi(weight_processed, height_processed)
 
 # Save BMI data
-write_parquet(bmi_calculated, 'parquet/bmi_calculated.parquet')
+write_parquet(bmi_calculated, 'data\\bmi_calculated.parquet')
 
 # ---------------------------------------------------------------------------
 # 4) Process blood pressure and calculate MAP
@@ -252,11 +280,74 @@ dbp_processed <- process_diastolic_bp(omop_vitals)
 bp_map_calculated <- calculate_map(sbp_processed, dbp_processed)
 
 # Save blood pressure and MAP data
-write_parquet(bp_map_calculated, 'parquet/bp_map_calculated.parquet')
+write_parquet(bp_map_calculated, 'data\\bp_map_calculated.parquet')
+
+# ---------------------------------------------------------------------------
+# 4b) Process SpO2 (pulse oximetry) measurements
+# ---------------------------------------------------------------------------
+
+process_spo2 <- function(vitals_data) {
+  vitals_data %>%
+    filter(MEASUREMENT_CONCEPT_ID %in% vital_concepts$spo2) %>%
+    filter(!is.na(VALUE_AS_NUMBER), VALUE_AS_NUMBER >= 70, VALUE_AS_NUMBER <= 100) %>%
+    mutate(
+      days_before_index = as.numeric(ymd(date_first) - ymd(MEASUREMENT_DATE)),
+      spo2 = VALUE_AS_NUMBER
+    ) %>%
+    filter(days_before_index >= 0 & days_before_index <= 365) %>%
+    select(PatientICN, MEASUREMENT_DATE, spo2, days_before_index, date_first)
+}
+
+# ---------------------------------------------------------------------------
+# 4c) Process temperature measurements (normalize to Celsius)
+# ---------------------------------------------------------------------------
+
+process_temperature <- function(vitals_data) {
+  vitals_data %>%
+    filter(MEASUREMENT_CONCEPT_ID %in% vital_concepts$temperature) %>%
+    filter(!is.na(VALUE_AS_NUMBER), VALUE_AS_NUMBER > 0) %>%
+    mutate(
+      # If value >= 85 it is clearly Fahrenheit; otherwise assume Celsius
+      temp_c = if_else(VALUE_AS_NUMBER >= 85,
+                       (VALUE_AS_NUMBER - 32) / 1.8,
+                       VALUE_AS_NUMBER)
+    ) %>%
+    filter(temp_c >= 35 & temp_c <= 42) %>%
+    mutate(
+      days_before_index = as.numeric(ymd(date_first) - ymd(MEASUREMENT_DATE)),
+      temperature = temp_c
+    ) %>%
+    filter(days_before_index >= 0 & days_before_index <= 365) %>%
+    select(PatientICN, MEASUREMENT_DATE, temperature, days_before_index, date_first)
+}
+
+spo2_processed        <- process_spo2(omop_vitals)
+temperature_processed <- process_temperature(omop_vitals)
 
 # ---------------------------------------------------------------------------
 # 5) Create 5-year trajectory datasets for spline modeling
 # ---------------------------------------------------------------------------
+
+# Function to prepare 5-year trajectory data for splines
+# Averages multiple measurements per day before creating trajectory
+get_prior_year_trajectory <- function(data, value_col, patient_col = "PatientICN") {
+  data %>%
+    filter(days_before_index >= 0 & days_before_index <= 365) %>%  # Within 1 years prior
+    # Average multiple measurements on the same day
+    group_by(!!sym(patient_col), MEASUREMENT_DATE, days_before_index) %>%
+    summarise(!!sym(value_col) := mean(!!sym(value_col), na.rm = TRUE), .groups = 'drop') %>%
+    # Now group by patient and filter for those with 3+ measurement days
+    group_by(!!sym(patient_col)) %>%
+    arrange(days_before_index) %>%
+    mutate(
+      measurement_number = row_number(),
+      total_measurements = n()
+    ) %>%
+    filter(total_measurements >= 3) %>%  # Require at least 3 measurements for spline
+    ungroup() %>%
+    select(!!sym(patient_col), days_before_index, MEASUREMENT_DATE, !!sym(value_col), 
+           measurement_number, total_measurements)
+}
 
 # Function to prepare 5-year trajectory data for splines
 # Averages multiple measurements per day before creating trajectory
@@ -286,8 +377,8 @@ bmi_trajectory_5yr <- get_five_year_trajectory(bmi_calculated, "bmi")
 map_trajectory_5yr <- get_five_year_trajectory(bp_map_calculated, "map")
 
 # Save trajectory datasets
-write_parquet(bmi_trajectory_5yr, 'parquet/bmi_trajectory_5yr.parquet')
-write_parquet(map_trajectory_5yr, 'parquet/map_trajectory_5yr.parquet')
+write_parquet(bmi_trajectory_5yr, 'data\\bmi_trajectory_5yr.parquet')
+write_parquet(map_trajectory_5yr, 'data\\map_trajectory_5yr.parquet')
 
 # ---------------------------------------------------------------------------
 # 6) Summary statistics for trajectories
@@ -438,8 +529,50 @@ map_spline_summary <- map_spline_summary %>%
 cat("MAP spline summaries calculated for", nrow(map_spline_summary), "patients\n")
 
 # Save spline summary statistics
-write_parquet(bmi_spline_summary, 'parquet/bmi_spline_summary.parquet')
-write_parquet(map_spline_summary, 'parquet/map_spline_summary.parquet')
+write_parquet(bmi_spline_summary, 'data\\bmi_spline_summary.parquet')
+write_parquet(map_spline_summary, 'data\\map_spline_summary.parquet')
+
+# ---------------------------------------------------------------------------
+# 7b) SBP and DBP 5-year spline summaries
+# ---------------------------------------------------------------------------
+
+sbp_trajectory_5yr <- get_five_year_trajectory(sbp_processed, "sbp")
+dbp_trajectory_5yr <- get_five_year_trajectory(dbp_processed, "dbp")
+
+sbp_spline_summary <- fit_spline_summary(sbp_trajectory_5yr, "sbp") %>%
+  rename_with(~paste0("sbp_", .), -PatientICN)
+
+dbp_spline_summary <- fit_spline_summary(dbp_trajectory_5yr, "dbp") %>%
+  rename_with(~paste0("dbp_", .), -PatientICN)
+
+cat("SBP spline summaries:", nrow(sbp_spline_summary), "patients\n")
+cat("DBP spline summaries:", nrow(dbp_spline_summary), "patients\n")
+
+write_parquet(sbp_trajectory_5yr, 'data\\sbp_trajectory_5yr.parquet')
+write_parquet(dbp_trajectory_5yr, 'data\\dbp_trajectory_5yr.parquet')
+write_parquet(sbp_spline_summary, 'data\\sbp_spline_summary.parquet')
+write_parquet(dbp_spline_summary, 'data\\dbp_spline_summary.parquet')
+
+# ---------------------------------------------------------------------------
+# 7c) SpO2 and Temperature 1-year spline summaries
+# ---------------------------------------------------------------------------
+
+spo2_trajectory_1yr <- get_prior_year_trajectory(spo2_processed, "spo2")
+temp_trajectory_1yr <- get_prior_year_trajectory(temperature_processed, "temperature")
+
+spo2_spline_summary <- fit_spline_summary(spo2_trajectory_1yr, "spo2") %>%
+  rename_with(~paste0("spo2_", .), -PatientICN)
+
+temp_spline_summary <- fit_spline_summary(temp_trajectory_1yr, "temperature") %>%
+  rename_with(~paste0("temp_", .), -PatientICN)
+
+cat("SpO2 spline summaries:", nrow(spo2_spline_summary), "patients\n")
+cat("Temp spline summaries:", nrow(temp_spline_summary), "patients\n")
+
+write_parquet(spo2_trajectory_1yr, 'data\\spo2_trajectory_1yr.parquet')
+write_parquet(temp_trajectory_1yr, 'data\\temp_trajectory_1yr.parquet')
+write_parquet(spo2_spline_summary, 'data\\spo2_spline_summary.parquet')
+write_parquet(temp_spline_summary, 'data\\temp_spline_summary.parquet')
 
 # ---------------------------------------------------------------------------
 # 8) Extract most recent pulse (heart rate) within prior year
@@ -466,7 +599,7 @@ most_recent_pulse <- hr_processed %>%
   select(PatientICN, recent_pulse = heart_rate, pulse_days_before = days_before_index)
 
 # Save most recent pulse
-write_parquet(most_recent_pulse, 'parquet/most_recent_pulse.parquet')
+write_parquet(most_recent_pulse, 'data\\most_recent_pulse.parquet')
 
 # ---------------------------------------------------------------------------
 # 9. Extract and process lab measurements (prior year splines)
@@ -494,14 +627,19 @@ lab_concepts <- list(
   leukocytes = loinc_to_concept %>% filter(CONCEPT_CODE %in% lab_loinc_codes$leukocytes) %>% pull(CONCEPT_ID)
 )
 
-# Extract lab measurements for cohort (prior year only for splines)
-omop_labs <- tbl(cdwwork, in_schema('OMOPV5', 'MEASUREMENT')) %>% 
-  inner_join(omop_xw, by = "PERSON_ID") %>% 
+# Extract lab measurements — broad scalar pull; days_before_index filter applied inside processing
+omop_labs <- tbl(cdwwork, in_schema('OMOPV5', 'MEASUREMENT')) %>%
+  inner_join(omop_xw, by = "PERSON_ID") %>%
   filter(MEASUREMENT_CONCEPT_ID %in% !!unlist(lab_concepts)) %>%
-  filter(MEASUREMENT_DATE >= one_years_prior_date & MEASUREMENT_DATE <= date_first) %>%  # within 1 year
-  select(PatientICN, PERSON_ID, MEASUREMENT_CONCEPT_ID, MEASUREMENT_DATE, 
+  filter(MEASUREMENT_DATE >= '2022-01-01' & MEASUREMENT_DATE <= !!as.character(global_pull_end)) %>%
+  select(PatientICN, PERSON_ID, MEASUREMENT_CONCEPT_ID, MEASUREMENT_DATE,
          VALUE_AS_NUMBER, UNIT_CONCEPT_ID, UNIT_SOURCE_VALUE, date_first) %>%
   collect()
+
+# M2 labs: replace anchor date
+omop_labs_m2 <- omop_labs %>%
+  inner_join(cohort_m2 %>% select(PatientICN, index_date), by = "PatientICN") %>%
+  mutate(date_first = index_date)
 
 # Process BUN measurements
 # Most common unit: mg/dL
@@ -594,14 +732,36 @@ bun_trajectory_1yr <- get_prior_year_trajectory(bun_data, "bun")
 albumin_trajectory_1yr <- get_prior_year_trajectory(albumin_data, "albumin")
 leukocytes_trajectory_1yr <- get_prior_year_trajectory(leukocytes_data, "leukocytes")
 
-# Save lab trajectory and spline data
-write_parquet(bun_trajectory_1yr, 'parquet/bun_trajectory_1yr.parquet')
-write_parquet(albumin_trajectory_1yr, 'parquet/albumin_trajectory_1yr.parquet')
-write_parquet(leukocytes_trajectory_1yr, 'parquet/leukocytes_trajectory_1yr.parquet')
+# Fit splines and extract summary statistics for BMI
+bun_spline_summary <- fit_spline_summary(bun_trajectory_1yr, "bun")
 
-write_parquet(bun_spline_summary, 'parquet/bun_spline_summary.parquet')
-write_parquet(albumin_spline_summary, 'parquet/albumin_spline_summary.parquet')
-write_parquet(leukocytes_spline_summary, 'parquet/leukocytes_spline_summary.parquet')
+# Rename columns for clarity
+bun_spline_summary <- bun_spline_summary %>%
+  rename_with(~paste0("bun_", .), -PatientICN)
+
+# Fit splines and extract summary statistics for MAP
+albumin_spline_summary <- fit_spline_summary(albumin_trajectory_1yr, "albumin")
+
+# Rename columns for clarity
+albumin_spline_summary <- albumin_spline_summary %>%
+  rename_with(~paste0("albumin_", .), -PatientICN)
+
+# Fit splines and extract summary statistics for MAP
+leukocytes_spline_summary <- fit_spline_summary(leukocytes_trajectory_1yr, "leukocytes")
+
+# Rename columns for clarity
+leukocytes_spline_summary <- leukocytes_spline_summary %>%
+  rename_with(~paste0("leuk_", .), -PatientICN)
+
+
+# Save lab trajectory and spline data
+write_parquet(bun_trajectory_1yr, 'data\\bun_trajectory_1yr.parquet')
+write_parquet(albumin_trajectory_1yr, 'data\\albumin_trajectory_1yr.parquet')
+write_parquet(leukocytes_trajectory_1yr, 'data\\leukocytes_trajectory_1yr.parquet')
+
+write_parquet(bun_spline_summary, 'data\\bun_spline_summary.parquet')
+write_parquet(albumin_spline_summary, 'data\\albumin_spline_summary.parquet')
+write_parquet(leukocytes_spline_summary, 'data\\leukocytes_spline_summary.parquet')
 
 # ---------------------------------------------------------------------------
 # 10) Create final combined feature dataset
@@ -610,15 +770,120 @@ write_parquet(leukocytes_spline_summary, 'parquet/leukocytes_spline_summary.parq
 # Combine all features
 final_vitals_features <- cohort %>%
   select(PatientICN, date_first) %>%
-  left_join(bmi_spline_summary, by = "PatientICN") %>%
-  left_join(map_spline_summary, by = "PatientICN") %>%
-  left_join(most_recent_pulse, by = "PatientICN") %>%
-  left_join(bun_spline_summary, by = "PatientICN") %>%
-  left_join(albumin_spline_summary, by = "PatientICN") %>%
+  left_join(bmi_spline_summary,        by = "PatientICN") %>%
+  left_join(map_spline_summary,        by = "PatientICN") %>%
+  left_join(sbp_spline_summary,        by = "PatientICN") %>%
+  left_join(dbp_spline_summary,        by = "PatientICN") %>%
+  left_join(spo2_spline_summary,       by = "PatientICN") %>%
+  left_join(temp_spline_summary,       by = "PatientICN") %>%
+  left_join(most_recent_pulse,         by = "PatientICN") %>%
+  left_join(bun_spline_summary,        by = "PatientICN") %>%
+  left_join(albumin_spline_summary,    by = "PatientICN") %>%
   left_join(leukocytes_spline_summary, by = "PatientICN")
 
-# Save combined features
-write_parquet(final_vitals_features, 'parquet/final_vitals_features_with_splines.parquet')
+# Save combined features (M1)
+write_parquet(final_vitals_features, 'data\\final_vitals_features_with_splines.parquet')
+
+# ===========================================================================
+# M2 VITALS FEATURES — anchored to index_date (ED arrival / IP admit date)
+# Reuses same processing functions; omop_vitals_m2 has date_first = index_date.
+# ===========================================================================
+cat("\n=== Processing M2 vital signs (index_date anchor) ===\n")
+
+weight_m2   <- process_weight(omop_vitals_m2)
+height_m2   <- process_height(omop_vitals_m2)
+bmi_m2      <- calculate_bmi(weight_m2, height_m2)
+sbp_m2      <- process_systolic_bp(omop_vitals_m2)
+dbp_m2      <- process_diastolic_bp(omop_vitals_m2)
+bp_map_m2   <- calculate_map(sbp_m2, dbp_m2)
+spo2_m2     <- process_spo2(omop_vitals_m2)
+temp_m2     <- process_temperature(omop_vitals_m2)
+
+bmi_traj_m2  <- get_five_year_trajectory(bmi_m2,    "bmi")
+map_traj_m2  <- get_five_year_trajectory(bp_map_m2, "map")
+sbp_traj_m2  <- get_five_year_trajectory(sbp_m2,    "sbp")
+dbp_traj_m2  <- get_five_year_trajectory(dbp_m2,    "dbp")
+spo2_traj_m2 <- get_prior_year_trajectory(spo2_m2,  "spo2")
+temp_traj_m2 <- get_prior_year_trajectory(temp_m2,  "temperature")
+
+bmi_spline_m2  <- fit_spline_summary(bmi_traj_m2,  "bmi")  %>% rename_with(~paste0("bmi_",  .), -PatientICN)
+map_spline_m2  <- fit_spline_summary(map_traj_m2,  "map")  %>% rename_with(~paste0("map_",  .), -PatientICN)
+sbp_spline_m2  <- fit_spline_summary(sbp_traj_m2,  "sbp")  %>% rename_with(~paste0("sbp_",  .), -PatientICN)
+dbp_spline_m2  <- fit_spline_summary(dbp_traj_m2,  "dbp")  %>% rename_with(~paste0("dbp_",  .), -PatientICN)
+spo2_spline_m2 <- fit_spline_summary(spo2_traj_m2, "spo2") %>% rename_with(~paste0("spo2_", .), -PatientICN)
+temp_spline_m2 <- fit_spline_summary(temp_traj_m2, "temperature") %>% rename_with(~paste0("temp_", .), -PatientICN)
+
+hr_m2 <- omop_vitals_m2 %>%
+  filter(MEASUREMENT_CONCEPT_ID %in% vital_concepts$heart_rate) %>%
+  filter(!is.na(VALUE_AS_NUMBER), VALUE_AS_NUMBER >= 30, VALUE_AS_NUMBER <= 300) %>%
+  mutate(days_before_index = as.numeric(ymd(date_first) - ymd(MEASUREMENT_DATE)),
+         heart_rate = VALUE_AS_NUMBER) %>%
+  filter(days_before_index >= 0 & days_before_index <= 365) %>%
+  select(PatientICN, MEASUREMENT_DATE, heart_rate, days_before_index)
+
+pulse_m2 <- hr_m2 %>%
+  group_by(PatientICN) %>%
+  arrange(days_before_index) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  select(PatientICN, recent_pulse = heart_rate, pulse_days_before = days_before_index)
+
+# M2 labs
+bun_m2 <- omop_labs_m2 %>%
+  filter(MEASUREMENT_CONCEPT_ID %in% lab_concepts$bun) %>%
+  filter(!is.na(VALUE_AS_NUMBER), VALUE_AS_NUMBER > 0) %>%
+  mutate(bun_mgdl = case_when(
+    tolower(UNIT_SOURCE_VALUE) %in% c('mg/dl', 'mg/dl', 'mg/dl') ~ VALUE_AS_NUMBER,
+    TRUE ~ VALUE_AS_NUMBER)) %>%
+  filter(bun_mgdl >= 1 & bun_mgdl <= 200) %>%
+  mutate(days_before_index = as.numeric(ymd(date_first) - ymd(MEASUREMENT_DATE)), bun = bun_mgdl) %>%
+  filter(days_before_index >= 0 & days_before_index <= 365) %>%
+  select(PatientICN, MEASUREMENT_DATE, bun, days_before_index)
+
+albumin_m2 <- omop_labs_m2 %>%
+  filter(MEASUREMENT_CONCEPT_ID %in% lab_concepts$albumin) %>%
+  filter(!is.na(VALUE_AS_NUMBER), VALUE_AS_NUMBER > 0) %>%
+  mutate(albumin_gdl = case_when(
+    tolower(UNIT_SOURCE_VALUE) %in% c('g/dl', 'gm/dl') ~ VALUE_AS_NUMBER,
+    tolower(UNIT_SOURCE_VALUE) %in% c('mg/dl') ~ VALUE_AS_NUMBER / 1000,
+    TRUE ~ VALUE_AS_NUMBER)) %>%
+  filter(albumin_gdl >= 1 & albumin_gdl <= 7) %>%
+  mutate(days_before_index = as.numeric(ymd(date_first) - ymd(MEASUREMENT_DATE)), albumin = albumin_gdl) %>%
+  filter(days_before_index >= 0 & days_before_index <= 365) %>%
+  select(PatientICN, MEASUREMENT_DATE, albumin, days_before_index)
+
+leukocytes_m2 <- omop_labs_m2 %>%
+  filter(MEASUREMENT_CONCEPT_ID %in% lab_concepts$leukocytes) %>%
+  filter(!is.na(VALUE_AS_NUMBER), VALUE_AS_NUMBER > 0) %>%
+  mutate(leukocytes_kul = VALUE_AS_NUMBER) %>%
+  filter(leukocytes_kul >= 0.5 & leukocytes_kul <= 100) %>%
+  mutate(days_before_index = as.numeric(ymd(date_first) - ymd(MEASUREMENT_DATE)), leukocytes = leukocytes_kul) %>%
+  filter(days_before_index >= 0 & days_before_index <= 365) %>%
+  select(PatientICN, MEASUREMENT_DATE, leukocytes, days_before_index)
+
+bun_traj_m2        <- get_prior_year_trajectory(bun_m2,        "bun")
+albumin_traj_m2    <- get_prior_year_trajectory(albumin_m2,    "albumin")
+leukocytes_traj_m2 <- get_prior_year_trajectory(leukocytes_m2, "leukocytes")
+
+bun_spline_m2        <- fit_spline_summary(bun_traj_m2,        "bun")        %>% rename_with(~paste0("bun_",   .), -PatientICN)
+albumin_spline_m2    <- fit_spline_summary(albumin_traj_m2,    "albumin")    %>% rename_with(~paste0("albumin_",.), -PatientICN)
+leukocytes_spline_m2 <- fit_spline_summary(leukocytes_traj_m2, "leukocytes") %>% rename_with(~paste0("leuk_",  .), -PatientICN)
+
+final_vitals_features_m2 <- cohort_m2 %>%
+  select(PatientICN) %>%
+  left_join(bmi_spline_m2,         by = "PatientICN") %>%
+  left_join(map_spline_m2,         by = "PatientICN") %>%
+  left_join(sbp_spline_m2,         by = "PatientICN") %>%
+  left_join(dbp_spline_m2,         by = "PatientICN") %>%
+  left_join(spo2_spline_m2,        by = "PatientICN") %>%
+  left_join(temp_spline_m2,        by = "PatientICN") %>%
+  left_join(pulse_m2,              by = "PatientICN") %>%
+  left_join(bun_spline_m2,         by = "PatientICN") %>%
+  left_join(albumin_spline_m2,     by = "PatientICN") %>%
+  left_join(leukocytes_spline_m2,  by = "PatientICN")
+
+write_parquet(final_vitals_features_m2, 'data\\final_vitals_features_with_splines_m2.parquet')
+cat("Saved final_vitals_features_with_splines_m2.parquet:", nrow(final_vitals_features_m2), "rows\n")
 
 
 

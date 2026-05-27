@@ -1,8 +1,8 @@
 ### Nick Cardamone
 ### OCC_PGHDPred
-### 2C. Medical conditions and comorobidities
+### 4 Medical conditions and comorobidities
 ### Date created: 4/28/2025
-### Last updated: 8/05/2025
+### Last updated: 5/15/2026
 
 # Features of interest for modeling (all within 2 years prior to index unless noted):
 
@@ -64,28 +64,58 @@ db_pghpred <- dbConnect(odbc::odbc(),
 # ---------------------------------------------------------------------------
 
 # Set working directory
-setwd("C:\\Users\\VHAPHICardaN\\OneDrive - Department of Veterans Affairs\\Desktop\\Projects\\OPS_Bressman-PGHDPred\\")
+
+setwd(
+  "C://Users//VHAPHICardaN//OneDrive - Department of Veterans Affairs//Desktop//Projects//OPS_Bressman-PGHDPred//pghdpred_deliverable"
+)
 
 # Cohort: contains PatientICN and upload window variables (e.g. date_first)
-cohort <- open_dataset('parquet\\pghd_final_full_visits_ids.parquet') %>%
+cohort = open_dataset('data\\pghd_final_full_visits_ids.parquet') %>% collect() %>% na.omit()
+
+# ---------------------------------------------------------------------------
+# M2 anchor: load index events and define dual-model cohort anchors
+# M2 = patients with date_first >= 2023-06-01 who also had a qualifying index event
+# ---------------------------------------------------------------------------
+index_events_m2 <- open_dataset('data\\index_event_prelim.parquet') %>%
+  collect() %>%
+  filter(!is.na(index_date)) %>%
+  select(PatientICN, index_date) %>%
+  mutate(index_date = as.Date(index_date))
+
+cohort_m2 <- cohort %>%
+  filter(as.Date(date_first) >= as.Date("2023-06-01")) %>%
+  inner_join(index_events_m2, by = "PatientICN")
+
+global_pull_end <- max(cohort_m2$index_date, na.rm = TRUE)
+cat("M2 cohort:", nrow(cohort_m2), "patients; pull end:", as.character(global_pull_end), "\n")
+
+# Date anchors for R-side per-patient window filtering (replaces SQL per-row filter)
+date_anchors_m1 <- cohort %>%
+  select(PatientICN, date_first) %>%
+  mutate(date_first      = as.Date(date_first),
+         two_years_prior = as.Date(date_first) - years(2))
+
+date_anchors_m2 <- cohort_m2 %>%
+  select(PatientICN, index_date) %>%
+  mutate(two_years_prior_m2 = as.Date(index_date) - years(2))
+
+# Map PatientICN -> PERSON_ID for OMOP joins — collected once into R to prevent
+# stale-temp-table errors (08S01) when the lazy chain is re-evaluated across queries.
+omop_xw <- tbl(cdwwork, in_schema('OMOPV5Map', 'SPatient_PERSON')) %>%
+  inner_join(cohort, by = "PatientICN", copy = TRUE) %>%
+  select(PatientICN, PERSON_ID) %>%
+  distinct() %>%
   collect()
 
-# Map PatientICN -> PERSON_ID for OMOP joins
-omop_xw <- tbl(cdwwork, in_schema('OMOPV5Map', 'SPatient_PERSON')) %>% 
-  inner_join(cohort, by = "PatientICN", copy = TRUE) %>% 
-  select(PatientICN, PERSON_ID, date_first, two_years_prior_date) %>%
+# ---------------------------------------------------------------------------
+# 2) Extract all ICD10 diagnosis and procedure codes — broad scalar pull,
+#    then apply M1/M2 date windows in R (avoids non-sargable per-row SQL filters)
+# ---------------------------------------------------------------------------
+omop_visit <- tbl(cdwwork, in_schema('OMOPV5', 'VISIT_OCCURRENCE')) %>%
+  filter(VISIT_START_DATE >= '2018-01-01' & VISIT_START_DATE <= !!as.character(global_pull_end)) %>%
+  select(VISIT_OCCURRENCE_ID, PERSON_ID, VISIT_START_DATE, VISIT_END_DATE, VISIT_CONCEPT_ID, VISIT_TYPE_CONCEPT_ID, VISIT_SOURCE_VALUE) %>%
+  inner_join(omop_xw, by = "PERSON_ID", copy = TRUE) %>%
   distinct()
-
-# ---------------------------------------------------------------------------
-# 2) Extract all ICD10 diagnosis and procedure codes for each person in prior 2 years
-# ---------------------------------------------------------------------------
-# Load all visits in 2 years prior to first upload date:
-omop_visit <- tbl(cdwwork, in_schema('OMOPV5', 'VISIT_OCCURRENCE')) %>% 
-  filter(VISIT_START_DATE >= '2019-01-01') %>% 
-  select(VISIT_OCCURRENCE_ID, PERSON_ID, VISIT_START_DATE, VISIT_END_DATE, VISIT_CONCEPT_ID, VISIT_TYPE_CONCEPT_ID, VISIT_SOURCE_VALUE) %>% 
-  inner_join(omop_xw, by = "PERSON_ID", copy = TRUE) %>% 
-  distinct() %>% 
-  filter(VISIT_START_DATE >= two_years_prior_date & VISIT_END_DATE <= date_first)
 
 # ---------------------------------------------------------------------------
 # 3) Define specific ICD-10 codes for medical conditions of interest
@@ -255,7 +285,7 @@ omop_proc_prior <- tbl(cdwwork, in_schema('OMOPV5', 'PROCEDURE_OCCURRENCE')) %>%
   select(VISIT_OCCURRENCE_ID, PROCEDURE_CONCEPT_ID) %>% 
   inner_join(omop_visit, by = "VISIT_OCCURRENCE_ID") %>% 
   inner_join(omop_proc_concept, by = c("PROCEDURE_CONCEPT_ID" = "CONCEPT_ID")) %>% 
-  transmute(PatientICN, ICD10 = ICD10ProcedureCode) %>% 
+  transmute(PatientICN, condition_date = as.Date(VISIT_START_DATE), ICD10 = ICD10ProcedureCode) %>% 
   distinct() %>% 
   collect()
 
@@ -264,23 +294,68 @@ omop_dx_prior <- tbl(cdwwork, in_schema('OMOPV5', 'CONDITION_OCCURRENCE')) %>%
   select(VISIT_OCCURRENCE_ID, CONDITION_CONCEPT_ID) %>% 
   inner_join(omop_visit, by = "VISIT_OCCURRENCE_ID") %>% 
   inner_join(omop_dx_concept, by = c("CONDITION_CONCEPT_ID" = "CONCEPT_ID")) %>% 
-  transmute(PatientICN, ICD10 = ICD10Code) %>% 
+  transmute(PatientICN, condition_date = as.Date(VISIT_START_DATE), ICD10 = ICD10Code) %>% 
   distinct() %>% 
   collect()
 
 # Combine all ICD10 codes (diagnosis + procedure) for prior period
-omop_icd10_prior <- rbind(omop_proc_prior, omop_dx_prior) %>% 
-  drop_na() %>%
-  mutate(code_clean = toupper(gsub("\\.", "", ICD10))) %>%
+omop_icd10_raw <- rbind(omop_proc_prior, omop_dx_prior) %>%
+  drop_na(PatientICN, ICD10) %>%
+  mutate(code_clean = toupper(gsub("\\.", "", ICD10)))
+
+# Save raw date-stamped condition records for admission-anchored re-aggregation in 3D script
+patient_condition_records_raw <- omop_icd10_raw %>%
+  distinct(PatientICN, condition_date, code_clean) %>%
+  rename(CONDITION_SOURCE_VALUE = code_clean)
+write_parquet(patient_condition_records_raw, "data\\patient_condition_records_raw.parquet")
+cat("Saved patient_condition_records_raw.parquet:", nrow(patient_condition_records_raw), "rows\n")
+
+# Apply M1 date window (2 years prior to date_first) — replaces SQL-side per-row filter
+omop_icd10_prior <- omop_icd10_raw %>%
+  inner_join(date_anchors_m1, by = "PatientICN") %>%
+  filter(condition_date >= two_years_prior & condition_date < date_first) %>%
   distinct(PatientICN, code_clean)
+
+# M2 date window (2 years prior to index_date) — M2-eligible patients only
+omop_icd10_m2_raw <- omop_icd10_raw %>%
+  inner_join(date_anchors_m2, by = "PatientICN") %>%
+  filter(condition_date >= two_years_prior_m2 & condition_date < index_date) %>%
+  distinct(PatientICN, code_clean)
+
+# Diagnosis-only filtered sets for CCI (procedure codes excluded from Charlson)
+omop_dx_m1 <- omop_dx_prior %>%
+  inner_join(date_anchors_m1, by = "PatientICN") %>%
+  filter(condition_date >= two_years_prior & condition_date < date_first) %>%
+  distinct(PatientICN, ICD10)
+
+omop_dx_m2 <- omop_dx_prior %>%
+  inner_join(date_anchors_m2, by = "PatientICN") %>%
+  filter(condition_date >= two_years_prior_m2 & condition_date < index_date) %>%
+  distinct(PatientICN, ICD10)
+
+# Charlson CCI — M1
+cci_df <- comorbidity::comorbidity(
+  x       = omop_dx_m1,
+  id      = "PatientICN",
+  code    = "ICD10",
+  map     = "charlson_icd10_quan",
+  assign0 = FALSE
+)
+cci_score_tbl <- tibble(
+  PatientICN = cci_df$PatientICN,
+  cci_score  = as.numeric(comorbidity::score(cci_df, weights = "quan", assign0 = FALSE))
+)
+cat("CCI M1 computed for", nrow(cci_score_tbl), "patients; mean =",
+    round(mean(cci_score_tbl$cci_score), 2), "\n")
 
 # ---------------------------------------------------------------------------
 # 5) Extract specific medical conditions using defined ICD-10 codes:
 # Extracted from Wei et al. 2024; https://pubmed.ncbi.nlm.nih.gov/38365301/
 # ---------------------------------------------------------------------------
 
-# Function to extract patients with specific ICD-10 codes
-extract_condition_patients <- function(icd_codes, condition_name) {
+# Function to extract patients with specific ICD-10 codes.
+# icd10_data defaults to omop_icd10_prior (M1); pass omop_icd10_m2_raw for M2.
+extract_condition_patients <- function(icd_codes, condition_name, icd10_data = omop_icd10_prior) {
   if (length(icd_codes) == 0) {
     cat("No codes defined for", condition_name, "\n")
     return(tibble(PatientICN = character(), !!condition_name := integer()))
@@ -292,7 +367,7 @@ extract_condition_patients <- function(icd_codes, condition_name) {
   # Create pattern for exact matching or prefix matching
   pattern_codes <- paste0("^(", paste(clean_codes, collapse = "|"), ")")
   
-  result <- omop_icd10_prior %>%
+  result <- icd10_data %>%
     filter(grepl(pattern_codes, code_clean)) %>%
     distinct(PatientICN) %>%
     mutate(!!condition_name := 1L)
@@ -353,18 +428,35 @@ condition_results$dialysis_access <- extract_condition_patients(
 # 6) Extract dialysis status using CPT codes (prior period)
 #  ---------------------------------------------------------------------------
 
-# Extract dialysis status using procedure_source_value in prior period
-dialysis_proc_prior <- tbl(cdwwork, in_schema('OMOPV5', 'PROCEDURE_OCCURRENCE')) %>% 
-  select(PERSON_ID, PROCEDURE_DATE, PROCEDURE_SOURCE_VALUE) %>% 
-  filter(!is.na(PROCEDURE_SOURCE_VALUE)) %>% 
+# Extract dialysis CPT codes — collect without SQL-side join, then join omop_xw in R
+# (avoids copy = TRUE temp-table re-creation on an aged connection)
+dialysis_proc_all <- tbl(cdwwork, in_schema('OMOPV5', 'PROCEDURE_OCCURRENCE')) %>%
+  select(PERSON_ID, PROCEDURE_DATE, PROCEDURE_SOURCE_VALUE) %>%
+  filter(!is.na(PROCEDURE_SOURCE_VALUE)) %>%
   filter(PROCEDURE_SOURCE_VALUE %in% !!dialysis_cpt_codes) %>%
-  inner_join(omop_xw %>% select(PatientICN, PERSON_ID, date_first, two_years_prior_date), by = 'PERSON_ID', copy = TRUE) %>% 
-  filter(PROCEDURE_DATE >= two_years_prior_date & PROCEDURE_DATE < date_first) %>% 
-  collect()
+  filter(PROCEDURE_DATE >= '2018-01-01' & PROCEDURE_DATE <= !!as.character(global_pull_end)) %>%
+  collect() %>%
+  inner_join(omop_xw, by = 'PERSON_ID')
 
-dialysis_proc_prior_icn <- dialysis_proc_prior %>% 
-  distinct(PatientICN) %>% 
-  mutate(py2_dialysis_status = 1L) 
+# M1: 2 years prior to date_first
+dialysis_proc_prior <- dialysis_proc_all %>%
+  inner_join(date_anchors_m1, by = "PatientICN") %>%
+  filter(as.Date(PROCEDURE_DATE) >= two_years_prior &
+           as.Date(PROCEDURE_DATE) < date_first)
+
+# M2: 2 years prior to index_date
+dialysis_proc_m2 <- dialysis_proc_all %>%
+  inner_join(date_anchors_m2, by = "PatientICN") %>%
+  filter(as.Date(PROCEDURE_DATE) >= two_years_prior_m2 &
+           as.Date(PROCEDURE_DATE) < index_date)
+
+dialysis_proc_prior_icn <- dialysis_proc_prior %>%
+  distinct(PatientICN) %>%
+  mutate(py2_dialysis_status = 1L)
+
+dialysis_proc_m2_icn <- dialysis_proc_m2 %>%
+  distinct(PatientICN) %>%
+  mutate(py2_dialysis_status = 1L)
 
 # ---------------------------------------------------------------------------
 # 7) Calculate Multimorbidity Weighted Index (MWI) using ICD-10 codes
@@ -592,6 +684,8 @@ omop_icd10_mwi_relevant <- omop_icd10_prior %>%
   )
 
 # Calculate MWI scores for each patient using vectorized approach
+mwi_expanded_lookup <- tibble()  # initialize here so M2 block can reference it
+
 if (nrow(omop_icd10_mwi_relevant) > 0) {
   
   # Create expanded lookup for prefix matching
@@ -632,7 +726,7 @@ if (nrow(omop_icd10_mwi_relevant) > 0) {
   all_patients <- tibble(PatientICN = unique(omop_icd10_prior$PatientICN))
   mwi_scores <- all_patients %>%
     left_join(patient_mwi_scores, by = "PatientICN") %>%
-    mutate(py2_mwi_score = replace_na(py_mwi_score, 0))
+    dplyr::mutate(py2_mwi_score = tidyr::replace_na(py2_mwi_score, 0))
   
   summary(mwi_scores$py2_mwi_score)
   
@@ -663,21 +757,89 @@ patient_condition_flags <- patient_condition_flags %>%
 patient_condition_flags <- patient_condition_flags %>%
   left_join(mwi_scores, by = "PatientICN")
 
+# Add Charlson CCI score
+patient_condition_flags <- patient_condition_flags %>%
+  left_join(cci_score_tbl, by = "PatientICN")
+
 # Replace NAs with 0 for all condition flags (but keep NA for MWI scores where appropriate)
 patient_condition_flags <- patient_condition_flags %>%
   mutate(across(starts_with("py2_") & !ends_with("_score"), ~replace_na(.x, 0L))) %>%
-  mutate(py2_mwi_score = replace_na(py2_mwi_score, 0)) %>%
+  mutate(py2_mwi_score = replace_na(py2_mwi_score, 0),
+         cci_score     = replace_na(cci_score, 0)) %>%
   group_by(PatientICN) %>%
   mutate(py2_dialysis_status = max(py2_dialysis_status, py2_dialysis_access)) %>%
-  select(-py_dialysis_access) %>%
   ungroup()
+
+# ===========================================================================
+# M2 CONDITION FLAGS — anchored to index_date (ED arrival / IP admit date)
+# ===========================================================================
+
+# Charlson CCI — M2
+cci_df_m2 <- comorbidity::comorbidity(
+  x       = omop_dx_m2,
+  id      = "PatientICN",
+  code    = "ICD10",
+  map     = "charlson_icd10_quan",
+  assign0 = FALSE
+)
+cci_score_tbl_m2 <- tibble(
+  PatientICN = cci_df_m2$PatientICN,
+  cci_score  = as.numeric(comorbidity::score(cci_df_m2, weights = "quan", assign0 = FALSE))
+)
+cat("CCI M2 computed for", nrow(cci_score_tbl_m2), "patients\n")
+
+# M2 condition extraction — same ICD-10 code lists, M2 date window
+condition_results_m2 <- lapply(names(condition_codes), function(nm) {
+  extract_condition_patients(condition_codes[[nm]], paste0("py2_", nm),
+                             icd10_data = omop_icd10_m2_raw)
+})
+names(condition_results_m2) <- names(condition_codes)
+
+# M2 MWI
+omop_icd10_mwi_m2 <- omop_icd10_m2_raw %>%
+  filter(str_detect(code_clean, paste0("^(", paste(mwi_patterns, collapse = "|"), ")")))
+
+if (nrow(omop_icd10_mwi_m2) > 0 && exists("mwi_expanded_lookup") && nrow(mwi_expanded_lookup) > 0) {
+  patient_mwi_m2 <- omop_icd10_mwi_m2 %>%
+    inner_join(mwi_expanded_lookup, by = "code_clean") %>%
+    distinct(PatientICN, condition_id, weight) %>%
+    group_by(PatientICN) %>%
+    summarise(py2_mwi_score = sum(weight), .groups = "drop")
+  mwi_scores_m2 <- tibble(PatientICN = unique(omop_icd10_m2_raw$PatientICN)) %>%
+    left_join(patient_mwi_m2, by = "PatientICN") %>%
+    mutate(py2_mwi_score = replace_na(py2_mwi_score, 0))
+} else {
+  mwi_scores_m2 <- tibble(PatientICN = unique(omop_icd10_m2_raw$PatientICN),
+                          py2_mwi_score = 0)
+}
+
+# M2 flags assembly
+patient_condition_flags_m2 <- cohort_m2 %>% select(PatientICN)
+for (i in seq_along(condition_results_m2)) {
+  patient_condition_flags_m2 <- patient_condition_flags_m2 %>%
+    left_join(condition_results_m2[[i]], by = "PatientICN")
+}
+patient_condition_flags_m2 <- patient_condition_flags_m2 %>%
+  left_join(dialysis_proc_m2_icn,  by = "PatientICN") %>%
+  left_join(mwi_scores_m2,          by = "PatientICN") %>%
+  left_join(cci_score_tbl_m2,       by = "PatientICN") %>%
+  mutate(across(starts_with("py2_") & !ends_with("_score"), ~replace_na(.x, 0L))) %>%
+  mutate(py2_mwi_score = replace_na(py2_mwi_score, 0),
+         cci_score     = replace_na(cci_score, 0)) %>%
+  group_by(PatientICN) %>%
+  mutate(py2_dialysis_status = max(py2_dialysis_status, py2_dialysis_access)) %>%
+  ungroup()
+
+write_parquet(patient_condition_flags_m2, "data\\patient_condition_flags_prior_m2.parquet")
+cat("Saved patient_condition_flags_prior_m2.parquet:", nrow(patient_condition_flags_m2), "rows\n")
 
 # ---------------------------------------------------------------------------
 # 9. Save results and create summary
 # ---------------------------------------------------------------------------
 
-# Save to parquet
-patient_condition_flags %>% write_parquet("parquet\\patient_condition_flags_prior.parquet")
+# Save to parquet (M1)
+patient_condition_flags %>% write_parquet("data\\patient_condition_flags_prior.parquet")
+patient_condition_flags <- open_dataset("data\\patient_condition_flags_prior.parquet") %>% collect()
 
 # Option 4: Base R approach
 names(patient_condition_flags) <- gsub("^py_", "py2_", names(patient_condition_flags))
@@ -710,14 +872,17 @@ if("py_mwi_score" %in% names(patient_condition_flags)) {
   print(mwi_summary)
 }
 
+patient_condition_flags <- patient_condition_flags 
+
 # Descriptive table of conditions flag in prior 2 years
-table1(~py_acute_renal_failure + py_artificial_openings + py_chronic_pancreatitis + 
-         py_chronic_ulcer_skin + py_congestive_heart_failure + py_drug_alcohol_dependence + 
-         py_drug_alcohol_psychosis + py_lung_severe_cancers + py_metastatic_cancer + 
-         py_pregnancy + py_heart_arrhythmias + py_dialysis_status, data = patient_condition_flags %>% mutate(across(where(is.numeric), as.factor)))
+table1(~py2_acute_renal_failure + 
+         py2_artificial_openings + py2_chronic_pancreatitis + 
+         py2_chronic_ulcer_skin + py2_congestive_heart_failure + py2_drug_alcohol_dependence + 
+         py2_drug_alcohol_psychosis + py2_lung_severe_cancers + py2_metastatic_cancer + 
+         py2_pregnancy + py2_heart_arrhythmias + py2_dialysis_status, data = patient_condition_flags%>% mutate(across(where(is.numeric), as.factor)))
 
 # prior 2 year MWI score
-table1(~py_mwi_score, data = patient_condition_flags)
+table1(~py2_mwi_score, data = patient_condition_flags)
 
 hist(patient_condition_flags$py2_mwi_score)
 

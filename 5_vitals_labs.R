@@ -80,7 +80,6 @@ index_events_m2 <- open_dataset('data\\index_event_prelim.parquet') %>%
   mutate(index_date = as.Date(index_date))
 
 cohort_m2 <- cohort %>%
-  filter(as.Date(date_first) >= as.Date("2023-06-01")) %>%
   inner_join(index_events_m2, by = "PatientICN")
 
 global_pull_end <- max(cohort_m2$index_date, na.rm = TRUE)

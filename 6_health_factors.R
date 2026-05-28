@@ -47,19 +47,18 @@ setwd(
 )
 
 # Cohort: contains PatientICN and upload window variables (e.g. date_first)
-cohort = open_dataset('data\\pghd_final_full_visits_ids.parquet') %>% collect() %>% na.omit()
+cohort = open_dataset('data\\input\\pghd_final_full_visits_ids.parquet') %>% collect() %>% na.omit()
 
 # ---------------------------------------------------------------------------
 # M2 anchor: load index events for patients with qualifying ED/IP event
 # ---------------------------------------------------------------------------
-index_events_m2 <- open_dataset('data\\index_event_prelim.parquet') %>%
+index_events_m2 <- open_dataset('data\\input\\index_event_prelim.parquet') %>%
   collect() %>%
   filter(!is.na(index_date)) %>%
   select(PatientICN, index_date) %>%
   mutate(index_date = as.Date(index_date))
 
 cohort_m2 <- cohort %>%
-  filter(as.Date(date_first) >= as.Date("2023-06-01")) %>%
   inner_join(index_events_m2, by = "PatientICN")
 
 global_pull_end <- max(cohort_m2$index_date, na.rm = TRUE)

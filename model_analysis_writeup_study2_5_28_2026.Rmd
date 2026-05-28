@@ -1,0 +1,2386 @@
+---
+title: "Patient-Generated Health Data as a Predictor of Adverse Outcomes in Veterans"
+subtitle: "Study 2 - Post-Discharge PGHD Cohort"
+author: "Nick Cardamone"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: false
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+    css: |
+      body { font-family: Helvetica, Arial, sans-serif; font-size: 13px; }
+      h1, h2, h3, h4 { font-family: Helvetica, Arial, sans-serif; }
+      .table { font-size: 12px; }
+      caption { font-size: 12px; font-style: italic; color: #555; }
+      .fig-caption { font-size: 11px; color: #555; margin-top: 4px; margin-bottom: 16px; }
+      .highlight-box { background: #f7f9fc; border-left: 4px solid #4575b4; padding: 10px 14px;
+                       margin: 12px 0; font-size: 12px; }
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi        = 300,
+  dev        = "png",
+  out.width  = "100%",
+  cache      = FALSE
+)
+
+options(knitr.table.format = "html")
+
+#  Packages 
+suppressPackageStartupMessages({
+  library(tidyverse) # multitude of pacakges related to data cleaning
+  library(arrow) # working with parquets
+  library(data.table) # working with large dtasets
+  library(pROC) # visualizing ROC curves
+  library(broom) # convert statistical objects to tidy objects
+  library(recipes) # making machine learning models
+  library(gtsummary) # elegant tables
+  library(gt) # elegant tables
+  library(kableExtra) # html tables
+  library(patchwork) # ordering visuals
+  library(scales) # reformatting numbers
+  library(sandwich) # cluster-robust standard errors
+  library(lmtest) # linear model tests
+  library(writexl) # saving to xlsx
+})
+
+for (pkg in c("xgboost", "glmnet", "PRROC", "downloadthis")) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    try(install.packages(pkg, repos = "https://cloud.r-project.org", quiet = TRUE), silent = TRUE)
+}
+if (requireNamespace("xgboost",      quietly = TRUE)) suppressPackageStartupMessages(library(xgboost)) # xgboost package
+if (requireNamespace("glmnet",       quietly = TRUE)) suppressPackageStartupMessages(library(glmnet)) # logistic regression
+if (requireNamespace("PRROC",        quietly = TRUE)) suppressPackageStartupMessages(library(PRROC)) # calcualte AUC
+if (requireNamespace("downloadthis", quietly = TRUE)) suppressPackageStartupMessages(library(downloadthis)) # download button
+
+# Set working directory 
+base_dir <- "C:/Users/VHAPHICardaN/OneDrive - Department of Veterans Affairs/Desktop/Projects/OPS_Bressman-PGHDPred/pghdpred_deliverable"
+setwd(base_dir)
+
+# Save figures and output data
+out_data    <- "data/pub/model2_study2"
+out_figures <- "figures/pub/model2_study2"
+out_output  <- "data/output/model2_study2"
+for (d in c(out_data, out_figures, out_output)) if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+
+# Fixed Study 2 cohort timing (global so chunks can run independently)
+inception_cutoff    <- as.Date("2022-01-01")
+max_horizon         <- 30L
+followup_window_days <- 90L
+data_end_raw        <- as.Date("2026-05-14")
+followup_cutoff     <- as.Date("2026-02-13")
+followup_cutoff_label <- format(followup_cutoff, "%B %d, %Y")
+inception_cutoff_m2 <- inception_cutoff
+max_pd_window <- 90L
+
+set.seed(2026L)
+'%!in%' <- function(x, y) !('%in%'(x, y))
+```
+
+```{r theme, include=FALSE}
+theme_science <- function(base_size = 9) {
+  ggplot2::theme_minimal(base_size = base_size) +
+    ggplot2::theme(
+      text             = ggplot2::element_text(family = "Gill Sans MT"),
+      plot.title       = ggplot2::element_text(size = base_size, face = "plain"),
+      axis.title       = ggplot2::element_text(size = base_size),
+      axis.text        = ggplot2::element_text(size = base_size - 1),
+      strip.text       = ggplot2::element_text(size = base_size),
+      legend.position  = "none",
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.border     = ggplot2::element_rect(colour = "black", fill = NA, linewidth = 0.4),
+      panel.background = ggplot2::element_rect(fill = "white", colour = NA)
+    )
+}
+
+event_colors <- c(
+  "ED Visit"  = "#d73027",
+  "Inpatient" = "#4575b4",
+  "Death"     = "#1a1a1a",
+  "No Event"  = "#69b3a2"
+)
+feat_colors <- c(
+  "Steps only"          = "#69b3a2",
+  "Static only"         = "#4575b4",
+  "Steps + static"      = "#d73027"
+)
+cohort_colors <- c(
+  "All" = "#1a1a1a",
+  "ED" = "#d73027",
+  "Inpatient" = "#4575b4"
+)
+juncture_labels_vec <- c("Wk01", "Wk02", "Wk03", "Wk04")
+feat_labels <- c(
+  model1_steps_only       = "Steps only",
+  model2_static_only      = "Static only",
+  model3_steps_and_static = "Steps + static"
+)
+```
+
+```{r helpers, include=FALSE}
+# Utility functions
+# Take largest among two observations of the same measurement on the same day.
+pmax_na <- function(...) {
+  x <- pmax(..., na.rm = TRUE); x[is.infinite(x)] <- NA_real_; x
+}
+# Round to 5 digits
+round_numeric <- function(df, digits = 5) {
+  if (is.null(df) || nrow(df) == 0) return(df)
+  df %>% mutate(across(where(is.numeric), ~round(., digits)))
+}
+# Remove outliers among each measurement
+remove_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE); q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  ifelse(x < (q1 - 1.5*iqr) | x > (q3 + 1.5*iqr), NA_real_, x)
+}
+
+# Format p-values
+fmt_p <- function(p) ifelse(is.na(p), "--", ifelse(p < 0.001, "<0.001", sprintf("%.3f", p)))
+
+# Rolling helpers
+roll_avg_with_days <- function(x, n) {
+  x0 <- fifelse(is.na(x), 0, x)
+  d  <- as.integer(!is.na(x))
+  s  <- frollsum(x0, n = n, align = "right")
+  k  <- frollsum(d,  n = n, align = "right")
+  avg <- fifelse(k > 0L, s / k, NA_real_)
+  list(avg = avg, days = k)
+}
+
+roll_sd <- function(x, n) {
+  if (length(x) == 0) return(numeric(0))
+  frollapply(x, n = n, FUN = function(w) {
+    valid <- w[!is.na(w)]
+    if (length(valid) >= 3L) sd(valid) else NA_real_
+  }, align = "right")
+}
+
+# Outcome helper 
+# Count days to event
+calc_y_horizon <- function(days_to_event, horizon_days) {
+  as.integer(!is.na(days_to_event) & days_to_event >= 1L & days_to_event <= horizon_days)
+}
+```
+```{r}
+# Model builders 
+# Dummy variables are pre-encoded as integers in modeling_data; recipes only
+# handle imputation, normalization, and zero-variance removal.
+# All categorical variables have their numeric variables set to "unknown". There were 38 cases where individuals had missinging medical condition information, those individuals were dropped. 
+make_recipe_glmnet <- function(train_df) {
+  recipe(Y ~ ., data = train_df) %>%
+    step_impute_median(all_numeric_predictors()) %>% # impute median for numeric features
+    step_zv(all_predictors()) %>% # drop any predictor that has no variance (i.e. all the same value)
+    step_normalize(all_numeric_predictors())  # normalize numeric
+}
+make_recipe_xgboost <- function(train_df) {
+  recipe(Y ~ ., data = train_df) %>%
+    step_zv(all_predictors()) %>% # norm
+    # imputation not needed because missingness is handled natively by xgboost
+    step_normalize(all_numeric_predictors()) 
+}
+
+# Undersampling 
+# We noticed we had considerably more non-event weeks than event weeks.
+undersample_by_patient <- function(df, ratio = 3L, seed = 2026L) {
+  set.seed(seed)
+  df <- as_tibble(df)
+  df %>%
+    group_by(PatientICN) %>%
+    group_modify(~{
+      pos <- .x %>% filter(Y == 1); neg <- .x %>% filter(Y == 0)
+      if (nrow(pos) == 0L) {
+        if (nrow(neg) > 0L) neg[sample.int(nrow(neg), min(8L, nrow(neg))), ] else .x[0L, ]
+      } else {
+        n_neg <- min(nrow(pos) * ratio, nrow(neg))
+        neg_s <- if (nrow(neg) > 0L && n_neg > 0L)
+          neg[sample.int(nrow(neg), n_neg), ] else .x[0L, ]
+        bind_rows(pos, neg_s)
+      }
+    }) %>% ungroup()
+}
+
+# Metrics
+compute_global_metrics <- function(y, pred) {
+  valid <- !is.na(y) & !is.na(pred)
+  y <- y[valid]; pred <- pred[valid]
+  roc_obj <- pROC::roc(response = y, predictor = pred, quiet = TRUE, direction = "<")
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  brier   <- mean((pred - y)^2) # brier score
+  # area under precision recall curve
+  pr_auc  <- tryCatch({
+    PRROC::pr.curve(scores.class0 = pred[y == 1], scores.class1 = pred[y == 0],
+                    curve = FALSE)$auc.integral
+  }, error = function(e) NA_real_)
+  eps   <- 1e-6
+  logit_p <- log(pmax(eps, pred) / pmax(eps, 1 - pred))
+  # slope
+  cal_slope <- tryCatch(
+    coef(suppressWarnings(glm(y ~ logit_p, family = binomial())))[["logit_p"]],
+    error = function(e) NA_real_)
+  brier_null <- mean(y) * (1 - mean(y))
+  # brier skill score: better than brier given imbalanced data because its normalized against null models brier 
+  bss        <- if (!is.na(brier_null) && brier_null > 0) 1 - brier / brier_null else NA_real_
+  list(roc = roc_obj, auc = auc_val, pr_auc = pr_auc, brier = brier, bss = bss, cal_slope = cal_slope)
+}
+
+# 
+make_calibration_table <- function(pred, y) {
+  breaks <- unique(quantile(pred, probs = seq(0, 1, by = 0.1), na.rm = TRUE))
+  tibble(predicted_prob = pred, actual = y) %>%
+    mutate(prob_bin = cut(predicted_prob,
+      breaks = breaks,
+      include.lowest = TRUE)) %>%
+    group_by(prob_bin) %>%
+    summarise(n = dplyr::n(), n_events = sum(actual),
+              mean_predicted = mean(predicted_prob),
+              observed_rate  = mean(actual), .groups = "drop") %>%
+    round_numeric()
+}
+
+#  kableExtra re-render fix (VA/Windows: stale RStudio notebook cache dir)
+# When the .Rproj.user/shared/notebooks chunk-cache directory is missing (e.g.
+# after a new RStudio session), RStudio's print.shiny.tag.list fires a warning
+# then an error trying to write HTML-dependency JSON to a stale path.
+# Fix: capture the path from the warning, create the directory, retry once.
+print.kableExtra <- function(x, ...) {
+  dep_dir <- NULL
+  withCallingHandlers(
+    tryCatch(
+      kableExtra:::print.kableExtra(x, ...),
+      error = function(e) {
+        if (grepl("cannot open the connection", conditionMessage(e), fixed = TRUE) &&
+            !is.null(dep_dir)) {
+          dir.create(dep_dir, recursive = TRUE, showWarnings = FALSE)
+          kableExtra:::print.kableExtra(x, ...)
+        } else {
+          stop(e)
+        }
+      }
+    ),
+    warning = function(w) {
+      if (grepl("cannot open file.*\\.Rproj\\.user", conditionMessage(w))) {
+        m <- regmatches(conditionMessage(w),
+                        regexpr("(?<=')[^']+(?=')", conditionMessage(w), perl = TRUE))
+        if (length(m) && nchar(m) > 0L) dep_dir <<- dirname(m)
+        invokeRestart("muffleWarning")
+      }
+    }
+  )
+}
+
+# gtsummary UTF-8 fix (VA/Windows: invalid byte sequences crash gt HTML render) 
+# Sanitizes all character columns in gtsummary internals before gt renders HTML
+print.gtsummary <- function(x, ...) {
+  safe_utf8 <- function(s) iconv(s, to = "UTF-8", sub = "")
+  walk_df   <- function(obj) {
+    if (is.data.frame(obj))
+      dplyr::mutate(obj, dplyr::across(where(is.character), safe_utf8))
+    else obj
+  }
+  x$table_body    <- walk_df(x$table_body)
+  x$table_styling <- lapply(x$table_styling, walk_df)
+  .orig <- get("print.gtsummary", envir = asNamespace("gtsummary"))
+  .orig(x, ...)
+}
+
+# Feature importance labeling
+classify_feature <- function(nm) {
+  case_when(
+    str_detect(nm, "k_steps_|low_activity") ~ "PGHD / step features",
+    str_detect(nm, "bmi_|map_|pulse|bun_|albumin_|leuk_|spo2")    ~ "Vitals & labs",
+    str_detect(nm, "py2_inpat|py_ed|py_urgent|py_appt")           ~ "Healthcare utilization",
+    str_detect(nm, "^py2_")                                        ~ "Comorbidity flags",
+    str_detect(nm, "Age|gender_|race_|eth_|marital_|gisurh_|pg_G|pg_Unknown|season_|days_obs_remaining") ~ "Demographics",
+    str_detect(nm, "cci_score")                                    ~ "Comorbidity flags",
+    str_detect(nm, "mst_|smoker|tobacco")                          ~ "Social history",
+    TRUE                                                            ~ "Other"
+  )
+}
+
+#  Feature display name lookup (used by missingness table, importance plots, coef tables) 
+feat_display_names <- c(
+  # PGHD / step features
+  k_steps_7d_avg               = "7-day avg. daily steps",
+  k_steps_7d_sd                = "7-day SD of daily steps",
+  k_steps_7d_miss_days         = "Missing days/week (7-day)",
+  k_steps_7d_avg_pctdiff       = "% change vs. prior 3-week avg.",
+  low_activity_days_7d         = "Low-activity days/week (7-day)",
+  low_activity_streak          = "Consecutive low-activity days",
+  k_steps_14d_avg              = "14-day avg. daily steps",
+  k_steps_14d_sd               = "14-day SD of daily steps",
+  k_steps_21d_avg              = "21-day avg. daily steps",
+  k_steps_21d_sd               = "21-day SD of daily steps",
+  # Vitals & labs
+  bmi_fitted_mean              = "BMI, fitted mean (kg/m\u00b2)",
+  bmi_slope                    = "BMI trend slope",
+  bmi_fitted_last              = "BMI, most recent fitted (kg/m\u00b2)",
+  map_fitted_mean              = "MAP, fitted mean (mmHg)",
+  map_fitted_last              = "MAP, most recent fitted (mmHg)",
+  map_slope                    = "MAP trend slope",
+  recent_pulse                 = "Heart rate, most recent (bpm)",
+  bun_value_mean               = "BUN, mean (mg/dL)",
+  bun_value_last               = "BUN, most recent (mg/dL)",
+  albumin_value_mean           = "Albumin, mean (g/dL)",
+  albumin_value_last           = "Albumin, most recent (g/dL)",
+  leuk_value_mean              = "WBC, mean (10\u00b3/\u00b5L)",
+  leuk_value_last              = "WBC, most recent (10\u00b3/\u00b5L)",
+  # Demographics
+  Age                          = "Age (years)",
+  # Gender (ref = Male)
+  gender_Female                = "Female (Male)",
+  gender_Unknown               = "Unknown Sex (Male)",
+  # Race (ref = White)
+  race_BlackOrAfricanAmerican  = "Black or African American (White)",
+  race_AmericanIndian          = "American Indian or Alaska Native (White)",
+  race_Asian                   = "Asian (White)",
+  race_PacificIslander         = "Native Hawaiian or Pacific Islander (White)",
+  race_Multiracial             = "Multiracial (White)",
+  race_Unknown                 = "Unknown Race (White)",
+  # Ethnicity (ref = Not Hispanic or Latino)
+  eth_HispanicOrLatino         = "Hispanic or Latino (Not Hispanic or Latino)",
+  eth_Unknown                  = "Unknown Ethnicity (Not Hispanic or Latino)",
+  # Marital status (ref = Married)
+  marital_Divorced             = "Divorced (Married)",
+  marital_NeverMarried         = "Never Married (Married)",
+  marital_Widowed              = "Widowed (Married)",
+  marital_Separated            = "Separated (Married)",
+  marital_Unknown              = "Unknown Marital Status (Married)",
+  # Rurality (ref = Urban)
+  gisurh_Rural                 = "Rural (Urban)",
+  gisurh_HighlyRural           = "Highly Rural (Urban)",
+  gisurh_Insular               = "Insular (Urban)",
+  gisurh_Unknown               = "Unknown Rurality (Urban)",
+  # VA Priority Group - individual groups (ref = Group 1)
+  pg_G2                        = "Priority Group 2 (Group 1)",
+  pg_G3                        = "Priority Group 3 (Group 1)",
+  pg_G4                        = "Priority Group 4 (Group 1)",
+  pg_G5                        = "Priority Group 5 (Group 1)",
+  pg_G6                        = "Priority Group 6 (Group 1)",
+  pg_G7                        = "Priority Group 7 (Group 1)",
+  pg_G8                        = "Priority Group 8 (Group 1)",
+  pg_Unknown                   = "Unknown Priority Group (Group 1)",
+  # Season (ref = Fall)
+  season_Spring                = "Spring (Fall)",
+  season_Summer                = "Summer (Fall)",
+  season_Winter                = "Winter (Fall)",
+  days_obs_remaining           = "Days remaining in follow-up",
+  # Healthcare utilization
+  py_ed                        = "ED visit, prior year",
+  py_urgent                    = "Urgent care visit, prior year",
+  py_appt_no_show              = "Appointment no-show, prior year",
+  py2_inpat_any                = "Any inpatient admission, 2-year",
+  py2_inpat_med_surg           = "Med./surgical admission, 2-year",
+  py2_inpat_mental_health      = "Mental health admission, 2-year",
+  py2_inpat_other              = "Other inpatient admission, 2-year",
+  py2_inpat_nursing_home       = "Nursing home admission, 2-year",
+  py2_IVC_n                    = "Community care stays, count (2-year)",
+  py2_IVC_los                  = "Community care LOS, days (2-year)",
+  py2_IVC                      = "Community care stay, any (2-year)",
+  py2_mwi_score                = "Multimorbidity Weighted Index (MWI)",
+  # Comorbidity flags
+  py2_congestive_heart_failure = "Congestive heart failure, 2-year",
+  py2_heart_arrhythmias        = "Cardiac arrhythmia, 2-year",
+  py2_drug_alcohol_dependence  = "Substance use disorder, 2-year",
+  py2_metastatic_cancer        = "Metastatic cancer, 2-year",
+  py2_lung_severe_cancers      = "Lung/severe cancer, 2-year",
+  py2_dialysis_status          = "Dialysis, 2-year",
+  py2_housing_instability      = "Housing instability, 2-year",
+  py2_financial_sdoh           = "Financial hardship, 2-year",
+  py2_acute_renal_failure      = "Acute renal failure, 2-year",
+  py2_artificial_openings      = "Artificial openings, 2-year",
+  py2_chronic_pancreatitis     = "Chronic pancreatitis, 2-year",
+  py2_chronic_ulcer_skin       = "Chronic skin/ulcer condition, 2-year",
+  py2_drug_alcohol_psychosis   = "Drug/alcohol-induced psychosis, 2-year",
+  py2_pregnancy                = "Pregnancy/peripartum condition, 2-year",
+  py2_nonspecific_psychosocial = "Nonspecific psychosocial condition, 2-year",
+  py2_dialysis_access          = "Dialysis access, 2-year",
+  # Social history
+  mst_Yes                      = "Military Sexual Trauma: Yes (No)",
+  current_smoker               = "Current smoker",
+  never_smoker                 = "Never smoker",
+  cci_score                    = "Charlson Comorbidity Index (CCI)"
+)
+```
+
+
+```{r data-load-m2, include = FALSE, eval = FALSE}
+# 
+# STUDY 2 DATA PIPELINE  Load raw inputs and build post-discharge daily data
+# 
+data_dir        <- file.path(base_dir, "data", "input")
+outcome_horizon <- 30L   # days for Y_30d label
+
+#  Preflight check 
+required_files_m2 <- c(
+  file.path(data_dir, "index_event_prelim.parquet"),
+  file.path(data_dir, "hcu_events_daily.parquet"),
+  file.path(data_dir, "pghd_final_full.parquet"),
+  file.path(data_dir, "cohort_full_demo.parquet"),
+  file.path(data_dir, "patient_condition_flags_prior_m2.parquet"),
+  file.path(data_dir, "final_vitals_features_with_splines_m2.parquet"),
+  file.path(data_dir, "final_health_factors_tobacco_mst_m2.parquet"),
+  file.path(data_dir, "hc_util_prior.parquet"))
+missing_files_m2 <- Filter(Negate(file.exists), required_files_m2)
+if (length(missing_files_m2) > 0L)
+  stop("Missing upstream parquet file(s):\n  ", paste(missing_files_m2, collapse = "\n  "))
+
+dir.create(out_output, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_data,   recursive = TRUE, showWarnings = FALSE)
+
+#  Index events 
+index_events_raw <- open_dataset(file.path(data_dir, "index_event_prelim.parquet")) %>%
+  collect() %>%
+  mutate(
+    index_date           = as.Date(index_date),
+    index_discharge_date = as.Date(index_discharge_date),
+    discharge_date       = coalesce(index_discharge_date, index_date),
+    index_event_type     = if_else(
+      as.integer(coalesce(index_inpat, 0L)) == 1L, "Inpatient", "ED")
+  )
+
+n0_pts  <- n_distinct(index_events_raw$PatientICN)
+n0_evts <- nrow(index_events_raw)
+
+index_events <- index_events_raw %>%
+  filter(discharge_date >= inception_cutoff_m2, discharge_date <= followup_cutoff)
+
+n1_pts  <- n_distinct(index_events$PatientICN)
+n1_evts <- nrow(index_events)
+eligible_icns <- unique(index_events$PatientICN)
+
+#  Static features cohort_static_m2 
+demo       <- open_dataset(file.path(data_dir, "cohort_full_demo.parquet")) %>% collect()
+cond_flags <- open_dataset(file.path(data_dir, "patient_condition_flags_prior_m2.parquet")) %>% collect()
+vitals     <- open_dataset(file.path(data_dir, "final_vitals_features_with_splines_m2.parquet")) %>%
+  select(PatientICN,
+         bmi_fitted_mean, bmi_slope, bmi_fitted_last,
+         map_fitted_mean, map_slope, map_fitted_last,
+         sbp_value_mean, dbp_value_mean,
+         spo2_value_mean, temp_value_mean, recent_pulse,
+         bun_value_mean, bun_value_last,
+         albumin_value_mean, albumin_value_last,
+         leuk_value_mean, leuk_value_last) %>% collect()
+health_fac <- open_dataset(file.path(data_dir, "final_health_factors_tobacco_mst_m2.parquet")) %>%
+  select(PatientICN, tobacco_status, mst_status) %>% collect()
+hc_util    <- open_dataset(file.path(data_dir, "hc_util_prior.parquet")) %>%
+  distinct() %>% collect()
+
+cohort_static_m2 <- demo %>%
+  select(PatientICN, Age, Race, Gender, Ethnicity, MaritalStatus, Married,
+         GISURH, PriorityGroup, dod) %>%
+  left_join(cond_flags, by = "PatientICN") %>%
+  left_join(hc_util,    by = "PatientICN") %>%
+  left_join(vitals,     by = "PatientICN") %>%
+  left_join(health_fac, by = "PatientICN")
+
+write_parquet(cohort_static_m2, file.path(out_output, "cohort_static_m2.parquet"))
+
+#  PGHD daily data 
+pghd_raw <- open_dataset(file.path(data_dir, "pghd_final_full.parquet")) %>%
+  filter(PatientICN %in% eligible_icns) %>%
+  select(PatientICN, date,
+         fit_das_exercise_steps, gar_das_exercise_steps, ah_das_exercise_steps,
+         fit_das_exercise_m,     gar_das_exercise_m,     ah_das_exercise_m) %>%
+  collect() %>%
+  mutate(
+    date             = as.Date(date),
+    fit_garmin_steps = pmax_na(fit_das_exercise_steps, gar_das_exercise_steps),
+    apple_steps      = ah_das_exercise_steps,
+    fit_garmin_m     = pmax_na(fit_das_exercise_m,     gar_das_exercise_m),
+    apple_m          = ah_das_exercise_m,
+    daily_steps      = coalesce(fit_garmin_steps, apple_steps),
+    daily_steps      = if_else(daily_steps == 0, NA_real_, daily_steps),
+    daily_exercise_m = coalesce(fit_garmin_m, apple_m),
+    daily_exercise_m = if_else(daily_exercise_m == 0, NA_real_, daily_exercise_m),
+    has_upload       = as.integer(!is.na(daily_steps) | !is.na(daily_exercise_m))
+  ) %>%
+  select(PatientICN, date, daily_steps, daily_exercise_m, has_upload)
+
+#  Outcome events 
+dod_tbl    <- demo %>%
+  select(PatientICN, dod) %>%
+  mutate(dod = as.Date(dod)) %>%
+  filter(!is.na(dod))
+
+hcu_events <- open_dataset(file.path(data_dir, "hcu_events_daily.parquet")) %>%
+  filter(PatientICN %in% eligible_icns) %>%
+  collect() %>%
+  mutate(
+    date       = as.Date(date),
+    event_flag = as.integer(
+      coalesce(as.integer(ed), 0L) | coalesce(as.integer(inpat_any), 0L))
+  ) %>%
+  filter(event_flag == 1L) %>%
+  select(PatientICN, date)
+
+# Treat death as an outcome event
+hcu_events <- bind_rows(
+  hcu_events,
+  dod_tbl %>% rename(date = dod)
+) %>%
+  distinct(PatientICN, date)
+
+#  Build post-discharge daily data 
+# Cross-join each index event with PGHD days in [1, max_pd_window] post-discharge
+pd_events_tbl <- index_events %>%
+  select(PatientICN, discharge_date, index_event_type)
+
+pd_daily <- pd_events_tbl %>%
+  inner_join(pghd_raw, by = "PatientICN", relationship = "many-to-many") %>%
+  mutate(days_post_discharge = as.integer(date - discharge_date)) %>%
+  filter(days_post_discharge >= 1L, days_post_discharge <= max_pd_window)
+
+gc()
+
+#  Step imputation (OLS: steps ~ exercise_m) 
+set.seed(2026L)
+imp_train_m2 <- pd_daily %>%
+  filter(!is.na(daily_steps), !is.na(daily_exercise_m))
+if (nrow(imp_train_m2) > 50000L)
+  imp_train_m2 <- slice_sample(imp_train_m2, n = 50000L)
+
+step_imp_m2 <- if (nrow(imp_train_m2) >= 50L)
+  suppressWarnings(lm(daily_steps ~ daily_exercise_m, data = imp_train_m2)) else NULL
+rm(imp_train_m2)
+
+if (!is.null(step_imp_m2)) {
+  miss_idx <- which(is.na(pd_daily$daily_steps) & !is.na(pd_daily$daily_exercise_m))
+  if (length(miss_idx) > 0L)
+    pd_daily$daily_steps[miss_idx] <- pmax(0, predict(step_imp_m2,
+      newdata = data.frame(daily_exercise_m = pd_daily$daily_exercise_m[miss_idx])))
+}
+pd_daily$daily_steps_imp <- pd_daily$daily_steps
+
+#  Compute rolling step features (within each patient-discharge episode) 
+pd_dt  <- as.data.table(pd_daily)
+by_ep  <- c("PatientICN", "discharge_date")
+setorder(pd_dt, PatientICN, discharge_date, days_post_discharge)
+
+pd_dt[, c("s7d_avg","s7d_days") := {
+  r <- roll_avg_with_days(daily_steps_imp, 7L); list(r$avg, r$days)
+}, by = by_ep]
+pd_dt[, k_steps_7d_avg         := s7d_avg / 1000]
+pd_dt[, k_steps_7d_miss_days   := as.integer(7L - fifelse(is.na(s7d_days), 0L, s7d_days))]
+pd_dt[, k_steps_7d_sd          := roll_sd(daily_steps_imp, 7L) / 1000, by = by_ep]
+
+pd_dt[, is_low_activity     := as.integer(!is.na(daily_steps_imp) & daily_steps_imp < 1000)]
+pd_dt[, low_activity_days_7d := frollsum(is_low_activity, n = 7L, align = "right"), by = by_ep]
+pd_dt[, low_activity_streak := {
+  s <- integer(.N); cur <- 0L
+  for (i in seq_len(.N)) {
+    if (is.na(is_low_activity[i])) { s[i] <- NA_integer_; cur <- 0L
+    } else if (is_low_activity[i] == 1L) { cur <- cur + 1L; s[i] <- cur
+    } else { s[i] <- 0L; cur <- 0L }
+  }; s
+}, by = by_ep]
+
+pd_dt[, c("s7d_avg","s7d_days","is_low_activity") := NULL]
+
+pd_daily_feats <- as_tibble(pd_dt)
+write_parquet(pd_daily_feats, file.path(out_output, "pd_daily_feats.parquet"))
+rm(pd_dt, pd_daily, pghd_raw); gc()
+```
+
+```{r build-junctures-m2, include = FALSE, eval = FALSE}
+# 
+# STUDY 2 JUNCTURE PIPELINE  snapshots at Wk01Ã¢â‚¬"Wk04
+# Outcomes labeled, static features joined, CONSORT + patient_summary saved
+# 
+pd_daily_feats   <- open_dataset(file.path(out_output, "pd_daily_feats.parquet")) %>% collect()
+cohort_static_m2 <- open_dataset(file.path(out_output, "cohort_static_m2.parquet")) %>% collect()
+
+if (!exists("index_events")) {
+  index_events <- open_dataset(file.path(data_dir, "index_event_prelim.parquet")) %>%
+    collect() %>%
+    mutate(
+      index_date           = as.Date(index_date),
+      index_discharge_date = as.Date(index_discharge_date),
+      discharge_date       = coalesce(index_discharge_date, index_date),
+      index_event_type     = if_else(
+        as.integer(coalesce(index_inpat, 0L)) == 1L, "Inpatient", "ED")
+    ) %>%
+    filter(discharge_date >= inception_cutoff_m2, discharge_date <= followup_cutoff)
+}
+
+juncture_days_vec <- c(Wk01 = 7L, Wk02 = 14L, Wk03 = 21L, Wk04 = 28L)
+
+#  Take juncture snapshot: last valid step row at or before cutoff day 
+junc_raw <- purrr::imap(juncture_days_vec, function(cutoff_day, junc_label) {
+  pd_daily_feats %>%
+    filter(days_post_discharge <= cutoff_day, !is.na(k_steps_7d_avg)) %>%
+    group_by(PatientICN, discharge_date) %>%
+    slice_max(days_post_discharge, n = 1L, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(juncture = junc_label, juncture_date = discharge_date + cutoff_day)
+}) %>% bind_rows()
+
+#  Y_30d: event in (juncture_date, juncture_date + outcome_horizon] 
+if (!exists("hcu_events")) {
+  hcu_dts <- open_dataset(file.path(data_dir, "hcu_events_daily.parquet")) %>%
+    filter(PatientICN %in% unique(index_events$PatientICN)) %>%
+    collect() %>%
+    mutate(date       = as.Date(date),
+           event_flag = as.integer(
+             coalesce(as.integer(ed), 0L) | coalesce(as.integer(inpat_any), 0L))) %>%
+    filter(event_flag == 1L) %>% select(PatientICN, date)
+  dod_dt  <- cohort_static_m2 %>%
+    select(PatientICN, dod) %>% filter(!is.na(dod)) %>%
+    mutate(date = as.Date(dod)) %>% select(PatientICN, date)
+  hcu_events <- bind_rows(hcu_dts, dod_dt) %>% distinct(PatientICN, date)
+  rm(hcu_dts, dod_dt)
+}
+
+first_event_after <- index_events %>%
+  select(PatientICN, discharge_date) %>%
+  left_join(hcu_events, by = "PatientICN", relationship = "many-to-many") %>%
+  filter(as.Date(date) > discharge_date) %>%
+  group_by(PatientICN, discharge_date) %>%
+  summarise(first_event_date = min(date, na.rm = TRUE), .groups = "drop")
+
+junc_labeled <- junc_raw %>%
+  left_join(first_event_after, by = c("PatientICN", "discharge_date")) %>%
+  mutate(
+    days_to_first_event = as.integer(
+      as.Date(first_event_date) - as.Date(juncture_date)),
+    Y_30d = as.integer(
+      !is.na(first_event_date) &
+      days_to_first_event >= 1L &
+      days_to_first_event <= outcome_horizon),
+    Y = Y_30d
+  )
+
+#  Manual dummy encoding for static features 
+add_dummies_m2 <- function(df) {
+  df %>% mutate(
+    gender_Female      = as.integer(!is.na(Gender) & toupper(Gender) == "FEMALE"),
+    gender_Unknown     = as.integer(is.na(Gender) | !toupper(Gender) %in% c("MALE","FEMALE")),
+    race_Black         = as.integer(!is.na(Race) & Race == "Black or African American"),
+    race_AI_AN         = as.integer(!is.na(Race) & Race == "American Indian or Alaska Native"),
+    race_Asian         = as.integer(!is.na(Race) & Race == "Asian"),
+    race_PI            = as.integer(!is.na(Race) & Race == "Native Hawaiian or Other Pacific Islander"),
+    race_Unknown       = as.integer(
+      is.na(Race) | !Race %in% c("White","Black or African American",
+        "American Indian or Alaska Native","Asian",
+        "Native Hawaiian or Other Pacific Islander")),
+    eth_Hispanic       = as.integer(!is.na(Ethnicity) & Ethnicity == "Hispanic or Latino"),
+    eth_Unknown        = as.integer(
+      is.na(Ethnicity) | !Ethnicity %in% c("Hispanic or Latino","Not Hispanic or Latino")),
+    marital_Divorced   = as.integer(!is.na(MaritalStatus) & toupper(MaritalStatus) == "DIVORCED"),
+    marital_Never      = as.integer(!is.na(MaritalStatus) &
+                           toupper(MaritalStatus) %in% c("NEVER MARRIED","SINGLE")),
+    marital_Widowed    = as.integer(!is.na(MaritalStatus) & toupper(MaritalStatus) == "WIDOWED"),
+    marital_Separated  = as.integer(!is.na(MaritalStatus) & toupper(MaritalStatus) == "SEPARATED"),
+    marital_Unknown    = as.integer(
+      is.na(MaritalStatus) |
+      !toupper(MaritalStatus) %in% c("MARRIED","DIVORCED","NEVER MARRIED",
+                                     "SINGLE","WIDOWED","SEPARATED")),
+    gisurh_Rural       = as.integer(!is.na(GISURH) & toupper(GISURH) == "R"),
+    gisurh_HighlyRural = as.integer(!is.na(GISURH) & toupper(GISURH) == "H"),
+    gisurh_Insular     = as.integer(!is.na(GISURH) & toupper(GISURH) == "I"),
+    gisurh_Unknown     = as.integer(
+      is.na(GISURH) | !toupper(GISURH) %in% c("U","R","H","I")),
+    .pg_num = suppressWarnings(
+      as.integer(str_extract(as.character(PriorityGroup), "[0-9]+"))),
+    pg_G2              = as.integer(!is.na(.pg_num) & .pg_num == 2L),
+    pg_G3              = as.integer(!is.na(.pg_num) & .pg_num == 3L),
+    pg_G4              = as.integer(!is.na(.pg_num) & .pg_num == 4L),
+    pg_G5              = as.integer(!is.na(.pg_num) & .pg_num == 5L),
+    pg_G6              = as.integer(!is.na(.pg_num) & .pg_num == 6L),
+    pg_G7              = as.integer(!is.na(.pg_num) & .pg_num == 7L),
+    pg_G8              = as.integer(!is.na(.pg_num) & .pg_num == 8L),
+    pg_Unknown         = as.integer(is.na(.pg_num) | !.pg_num %in% 1:8),
+    mst_Yes            = as.integer(toupper(as.character(mst_status)) == "YES"),
+    current_smoker     = as.integer(tolower(as.character(tobacco_status)) == "current smoker"),
+    never_smoker       = as.integer(tolower(as.character(tobacco_status)) == "never smoker"),
+    index_event_type_Inpatient = as.integer(index_event_type == "Inpatient")
+  ) %>% select(-.pg_num)
+}
+
+# Static columns available in cohort_static_m2
+static_join_cols <- intersect(
+  c("PatientICN","Age","Race","Gender","Ethnicity","MaritalStatus","Married",
+    "GISURH","PriorityGroup","dod",
+    names(cond_flags)[names(cond_flags) != "PatientICN"],
+    names(hc_util)[names(hc_util) != "PatientICN"],
+    names(vitals)[names(vitals) != "PatientICN"],
+    names(health_fac)[names(health_fac) != "PatientICN"]),
+  names(cohort_static_m2))
+
+junc_full <- junc_labeled %>%
+  left_join(cohort_static_m2 %>% select(all_of(static_join_cols)), by = "PatientICN") %>%
+  add_dummies_m2()
+
+junc_all <- junc_full
+junc_ed  <- junc_full %>% filter(index_event_type == "ED")
+junc_inp <- junc_full %>% filter(index_event_type == "Inpatient")
+
+write_parquet(junc_all, file.path(out_output, "junc_all.parquet"))
+write_parquet(junc_ed,  file.path(out_output, "junc_ed.parquet"))
+write_parquet(junc_inp, file.path(out_output, "junc_inp.parquet"))
+
+#  CONSORT counts 
+n2_pts     <- n_distinct(pd_daily_feats$PatientICN[pd_daily_feats$has_upload == 1L])
+n3_pts     <- n_distinct(junc_all$PatientICN[junc_all$juncture == "Wk01"])
+n3_pts_ed  <- n_distinct(junc_ed$PatientICN[junc_ed$juncture  == "Wk01"])
+n3_pts_inp <- n_distinct(junc_inp$PatientICN[junc_inp$juncture == "Wk01"])
+
+tibble(n0_pts   = n0_pts,   n0_evts = n0_evts,
+       n1_pts   = n1_pts,   n1_evts = n1_evts,
+       n2_pts   = n2_pts,
+       n3_pts   = n3_pts,
+       n3_pts_ed  = n3_pts_ed,
+       n3_pts_inp = n3_pts_inp) %>%
+  write_parquet(file.path(out_output, "consort_counts_m2.parquet"))
+
+#  Patient summary (for Figure 2 KM and Table 1) 
+dod_vec <- setNames(as.Date(cohort_static_m2$dod), cohort_static_m2$PatientICN)
+patient_summary_m2 <- index_events %>%
+  left_join(first_event_after, by = c("PatientICN", "discharge_date")) %>%
+  mutate(
+    obs_end            = discharge_date + max_pd_window,
+    days_to_event      = as.integer(as.Date(first_event_date) - discharge_date),
+    had_event_30d      = as.integer(!is.na(days_to_event) & days_to_event <= outcome_horizon),
+    first_event_type   = case_when(
+      !is.na(first_event_date) &
+        as.Date(first_event_date) == dod_vec[as.character(PatientICN)] ~ "Death",
+      index_event_type == "Inpatient" & !is.na(first_event_date)       ~ "Inpatient Readmission",
+      index_event_type == "ED"        & !is.na(first_event_date)       ~ "ED Return",
+      is.na(first_event_date)                                           ~ "No Event",
+      TRUE                                                               ~ "Event")
+  ) %>%
+  left_join(cohort_static_m2 %>% select(-dod), by = "PatientICN")
+
+write_parquet(patient_summary_m2, file.path(out_output, "patient_summary_m2.parquet"))
+
+#  Table 1 data 
+tbl1_data_m2 <- patient_summary_m2 %>%
+  mutate(
+    Gender           = factor(Gender),
+    Race             = factor(Race),
+    Ethnicity        = factor(Ethnicity),
+    MaritalStatus    = factor(MaritalStatus),
+    GISURH           = factor(GISURH),
+    PriorityGroup    = factor(PriorityGroup),
+    mst_status       = factor(mst_status),
+    tobacco_status   = factor(tobacco_status),
+    index_event_type = factor(index_event_type, levels = c("ED","Inpatient")),
+    first_event_type = factor(first_event_type,
+      levels = c("Death","Inpatient Readmission","ED Return","No Event")),
+    had_event        = as.integer(first_event_type != "No Event")
+  )
+
+write_parquet(tbl1_data_m2, file.path(out_output, "tbl1_data_m2.parquet"))
+
+#  Inline parameters 
+tibble(
+  data_start_date       = format(inception_cutoff_m2, "%B %d, %Y"),
+  data_end_date         = format(data_end_raw,        "%B %d, %Y"),
+  followup_cutoff_label = format(followup_cutoff,     "%B %d, %Y"),
+  max_pd_window         = as.integer(max_pd_window),
+  outcome_horizon       = as.integer(outcome_horizon)
+) %>% write_parquet(file.path(out_output, "inline_params_m2.parquet"))
+```
+
+```{r train-test-m2, eval = FALSE}
+# 
+# TRAIN / TEST SPLIT patient-level 70/30, shared across all cohorts/junctures
+# 
+junc_all <- open_dataset(file.path(out_output, "junc_all.parquet")) %>% collect()
+
+set.seed(2026L)
+all_pts_m2   <- unique(junc_all$PatientICN)
+train_pts_m2 <- sample(all_pts_m2, floor(0.7 * length(all_pts_m2)))
+test_pts_m2  <- setdiff(all_pts_m2, train_pts_m2)
+
+write_parquet(tibble(PatientICN = train_pts_m2), file.path(out_output, "train_pts_m2.parquet"))
+write_parquet(tibble(PatientICN = test_pts_m2),  file.path(out_output, "test_pts_m2.parquet"))
+
+#  Feature column sets 
+step_cols_m2 <- c(
+  "k_steps_7d_avg","k_steps_7d_sd","k_steps_7d_miss_days",
+  "low_activity_days_7d","low_activity_streak"
+)
+
+static_cols_m2_base <- c(
+  "Age",
+  "gender_Female","gender_Unknown",
+  "race_Black","race_AI_AN","race_Asian","race_PI","race_Unknown",
+  "eth_Hispanic","eth_Unknown",
+  "marital_Divorced","marital_Never","marital_Widowed","marital_Separated","marital_Unknown",
+  "gisurh_Rural","gisurh_HighlyRural","gisurh_Insular","gisurh_Unknown",
+  "pg_G2","pg_G3","pg_G4","pg_G5","pg_G6","pg_G7","pg_G8","pg_Unknown",
+  "cci_score",
+  "py2_acute_renal_failure","py2_congestive_heart_failure","py2_drug_alcohol_dependence",
+  "py2_lung_severe_cancers","py2_metastatic_cancer","py2_heart_arrhythmias",
+  "py2_dialysis_status","py2_inpat_any","py2_inpat_med_surg","py2_inpat_mental_health",
+  "py_ed","py_urgent",
+  "bmi_fitted_mean","map_fitted_mean","recent_pulse",
+  "bun_value_mean","albumin_value_mean","leuk_value_mean",
+  "mst_Yes","current_smoker","never_smoker")
+
+static_cols_m2_all    <- c(static_cols_m2_base, "index_event_type_Inpatient")
+static_cols_by_cohort <- list(
+  All       = static_cols_m2_all,
+  ED        = static_cols_m2_base,
+  Inpatient = static_cols_m2_base)
+
+#  Missingness table (across all junctures "” row-level and person-level)
+keep_check <- intersect(c(step_cols_m2, static_cols_m2_all), names(junc_all))
+
+miss_tbl_m2 <- {
+  feat_data <- junc_all %>% select(PatientICN, all_of(keep_check))
+  feat_cols  <- keep_check
+
+  junc_miss <- feat_data %>%
+    select(all_of(feat_cols)) %>%
+    summarise(across(everything(), ~ mean(is.na(.)))) %>%
+    pivot_longer(everything(), names_to = "Feature", values_to = "pct_missing_week")
+
+  person_miss <- feat_data %>%
+    group_by(PatientICN) %>%
+    summarise(across(all_of(feat_cols), ~ any(is.na(.))), .groups = "drop") %>%
+    select(all_of(feat_cols)) %>%
+    summarise(across(everything(), ~ mean(.))) %>%
+    pivot_longer(everything(), names_to = "Feature", values_to = "pct_missing_person")
+
+  left_join(junc_miss, person_miss, by = "Feature") %>%
+    mutate(
+      pct_missing_week   = round(pct_missing_week   * 100, 1),
+      pct_missing_person = round(pct_missing_person * 100, 1)
+    ) %>%
+    filter(pct_missing_week > 0) %>%
+    arrange(desc(pct_missing_week))
+}
+
+gc()
+write_parquet(miss_tbl_m2, file.path(out_output, "miss_tbl_m2.parquet"))
+```
+
+
+```{r missingness-table}
+miss_tbl <- arrow::read_parquet(file.path(out_output, "miss_tbl_m2.parquet"),
+                                mmap = FALSE) %>%
+  mutate(
+    label    = coalesce(feat_display_names[Feature], Feature),
+    category = classify_feature(Feature)
+  ) %>%
+  arrange(category, desc(pct_missing_week)) %>%
+  select(category, label, pct_missing_week, pct_missing_person) %>%
+  mutate(across(where(is.character), ~ iconv(., from = "", to = "UTF-8", sub = "byte")))
+
+kbl_miss <- miss_tbl %>%
+  gt(groupname_col = "category") %>%
+  cols_label(
+    label              = "Feature",
+    pct_missing_week   = "Junctures Missing (%)",
+    pct_missing_person = "Patients Missing (%)"
+  ) %>%
+  tab_header(title = html(paste0(
+    "Table S1. Missingness rates before imputation. ",
+    "\u2018Junctures Missing\u2019: % of juncture rows (across Wk01\u2013Wk04) with a missing value. ",
+    "\u2018Patients Missing\u2019: % of patients with \u22651 missing juncture for that feature."
+  ))) %>%
+  cols_align(align = "left",  columns = label) %>%
+  cols_align(align = "right", columns = c(pct_missing_week, pct_missing_person)) %>%
+  cols_width(label ~ px(350)) %>%
+  tab_options(
+    table.font.size       = px(12),
+    table.width           = "auto",
+    row_group.font.weight = "bold"
+  )
+
+kbl_miss
+```
+
+
+```{r model-fitting-m2, eval = FALSE}
+# 
+# FIT 72 MODELS: 3 cohorts "” 4 junctures "” 3 feature sets "” 2 algorithms
+# 
+junc_all <- open_dataset(file.path(out_output, "junc_all.parquet")) %>% collect()
+junc_ed  <- open_dataset(file.path(out_output, "junc_ed.parquet"))  %>% collect()
+junc_inp <- open_dataset(file.path(out_output, "junc_inp.parquet")) %>% collect()
+
+train_pts_m2 <- open_dataset(file.path(out_output, "train_pts_m2.parquet")) %>%
+  collect() %>% pull(PatientICN)
+test_pts_m2  <- open_dataset(file.path(out_output, "test_pts_m2.parquet")) %>%
+  collect() %>% pull(PatientICN)
+
+cohort_data_m2 <- list(All = junc_all, ED = junc_ed, Inpatient = junc_inp)
+
+fit_m2_one <- function(coh_nm, junc, feature_mode, model_type) {
+  df <- cohort_data_m2[[coh_nm]] %>% filter(juncture == junc)
+  if (nrow(df) == 0L) return(NULL)
+
+  avail_step   <- intersect(step_cols_m2,                     names(df))
+  avail_static <- intersect(static_cols_by_cohort[[coh_nm]],  names(df))
+
+  keep_feats <- switch(feature_mode,
+    model1_steps_only       = avail_step,
+    model2_static_only      = avail_static,
+    model3_steps_and_static = union(avail_step, avail_static),
+    return(NULL))
+  if (length(keep_feats) == 0L) return(NULL)
+
+  tr_full <- df %>%
+    filter(PatientICN %in% train_pts_m2) %>%
+    select(PatientICN, Y, all_of(keep_feats)) %>%
+    filter(!is.na(Y))
+  te <- df %>%
+    filter(PatientICN %in% test_pts_m2) %>%
+    select(Y, all_of(keep_feats)) %>%
+    filter(!is.na(Y)) %>% as.data.frame()
+
+  if (sum(tr_full$Y) < 5 || sum(te$Y) < 5) return(NULL)
+
+  spw_true     <- sum(tr_full$Y == 0) / max(sum(tr_full$Y == 1), 1)
+  tr_under_full <- undersample_by_patient(tr_full)
+  pat_ids_under <- tr_under_full %>% pull(PatientICN)
+  tr_under      <- as.data.frame(tr_under_full %>% select(-PatientICN))
+  tr_full_df    <- as.data.frame(tr_full %>% select(-PatientICN))
+  y_te <- te$Y
+
+  if (model_type == "logistic") {
+    rec  <- make_recipe_glmnet(tr_under)
+    prp  <- prep(rec, training = tr_under, retain = TRUE)
+    trb  <- bake(prp, new_data = tr_under)
+    teb  <- bake(prp, new_data = te)
+    fit  <- tryCatch(
+      suppressWarnings(glm(Y ~ ., data = trb, family = binomial())),
+      error = function(e) NULL)
+    if (is.null(fit)) return(NULL)
+    pred_raw <- predict(fit, newdata = teb, type = "response")
+    coef_tbl <- tryCatch({
+      vcov_cl <- sandwich::vcovCL(fit, cluster = data.frame(id = pat_ids_under))
+      ct      <- lmtest::coeftest(fit, vcov = vcov_cl)
+      as.data.frame(ct) %>%
+        tibble::rownames_to_column("term") %>% as_tibble() %>%
+        rename(estimate = Estimate, std.error = `Std. Error`,
+               statistic = `z value`, p.value = `Pr(>|z|)`) %>%
+        mutate(odds_ratio   = exp(estimate),
+               cohort       = coh_nm, juncture = junc,
+               feature_mode = feature_mode, model_type = model_type)
+    }, error = function(e) {
+      broom::tidy(fit) %>%
+        mutate(odds_ratio   = exp(estimate),
+               cohort       = coh_nm, juncture = junc,
+               feature_mode = feature_mode, model_type = model_type)
+    })
+  } else {
+    rec   <- make_recipe_xgboost(tr_full_df)
+    prp   <- prep(rec, training = tr_full_df, retain = TRUE)
+    trb   <- bake(prp, new_data = tr_full_df)
+    teb   <- bake(prp, new_data = te)
+    y_tr  <- as.numeric(trb$Y)
+    x_tr  <- as.matrix(trb %>% select(-Y) %>% mutate(across(everything(), as.numeric)))
+    x_te  <- as.matrix(teb %>% select(-Y) %>% mutate(across(everything(), as.numeric)))
+    dtrain <- xgboost::xgb.DMatrix(x_tr, label = y_tr)
+    dtest  <- xgboost::xgb.DMatrix(x_te, label = y_te)
+    fit    <- xgboost::xgb.train(
+      params = list(
+        objective         = "binary:logistic", eval_metric = "auc",
+        eta               = 0.05,  max_depth        = 5,
+        min_child_weight  = 3,     subsample        = 0.7,
+        colsample_bytree  = 0.7,   scale_pos_weight = spw_true),
+      data = dtrain, nrounds = 200L, verbose = 0L,
+      watchlist = list(train = dtrain, test = dtest),
+      early_stopping_rounds = 15L)
+    pred_raw <- predict(fit, dtest)
+    imp      <- xgboost::xgb.importance(model = fit)
+    coef_tbl <- tibble(
+      term         = imp$Feature, gain = imp$Gain,
+      cover        = imp$Cover,   frequency  = imp$Frequency,
+      cohort       = coh_nm,      juncture   = junc,
+      feature_mode = feature_mode, model_type = model_type)
+  }
+
+  # Platt calibration
+  eps_cal       <- 1e-6
+  logit_raw     <- log(pmax(eps_cal, pred_raw) / pmax(eps_cal, 1 - pred_raw))
+  cal_slope_raw <- tryCatch(
+    coef(suppressWarnings(
+      glm(as.integer(y_te) ~ logit_raw, family = binomial())))["logit_raw"],
+    error = function(e) NA_real_)
+  pl   <- tryCatch(
+    suppressWarnings(glm(y_te ~ pred_raw, family = binomial())),
+    error = function(e) NULL)
+  pred <- if (!is.null(pl)) predict(pl, type = "response") else pred_raw
+  m    <- compute_global_metrics(as.integer(y_te), pred)
+
+  roc_obj <- tryCatch(
+    pROC::roc(as.integer(y_te), pred, quiet = TRUE),
+    error = function(e) NULL)
+
+  list(
+    summary = tibble(
+      cohort              = coh_nm, juncture = junc,
+      feature_mode        = feature_mode, model_type = model_type,
+      auc                 = round(m$auc,    4),
+      pr_auc              = round(m$pr_auc, 4),
+      brier               = round(m$brier,  5),
+      cal_slope           = round(m$cal_slope,     4),
+      cal_slope_pre_platt = round(cal_slope_raw,   4),
+      n_test              = length(y_te),
+      events_test         = sum(as.integer(y_te))),
+    roc         = roc_obj,
+    pred        = pred,
+    y           = as.integer(y_te),
+    coef_tbl    = coef_tbl,
+    calibration = make_calibration_table(pred, as.integer(y_te)),
+    cohort      = coh_nm, juncture = junc,
+    feature_mode = feature_mode, model_type = model_type
+  )
+}
+
+#  Run all 72 models 
+cohort_names <- c("All","ED","Inpatient")
+feature_sets <- c("model1_steps_only","model2_static_only","model3_steps_and_static")
+model_types  <- c("logistic","xgboost")
+
+m2_results <- list()
+for (coh in cohort_names) {
+  for (junc in juncture_labels_vec) {
+    for (fm in feature_sets) {
+      for (mt in model_types) {
+        res <- tryCatch(
+          fit_m2_one(coh, junc, fm, mt),
+          error = function(e) {
+            message("Error: ", coh, "/", junc, "/", fm, "/", mt, ": ", e$message)
+            NULL
+          })
+        if (!is.null(res)) m2_results <- append(m2_results, list(res))
+      }
+    }
+  }
+}
+
+m2_summaries <- bind_rows(lapply(m2_results, `[[`, "summary"))
+
+writexl::write_xlsx(as.data.frame(m2_summaries),
+  file.path(out_data, "Table2_model_performance_m2.xlsx"))
+write_parquet(m2_summaries, file.path(out_output, "m2_summaries.parquet"))
+
+m2_roc_data_wk04 <- bind_rows(lapply(
+  Filter(function(r) !is.null(r$roc) && r$juncture == "Wk04", m2_results),
+  function(r) data.frame(
+    fpr          = 1 - r$roc$specificities,
+    tpr          = r$roc$sensitivities,
+    cohort       = r$cohort,
+    feature_mode = r$feature_mode,
+    model_type   = r$model_type,
+    auc_val      = as.numeric(pROC::auc(r$roc)))))
+write_parquet(m2_roc_data_wk04, file.path(out_output, "m2_roc_data_wk04.parquet"))
+
+m2_xgb_importance <- bind_rows(lapply(
+  Filter(function(r) r$model_type == "xgboost", m2_results),
+  function(r) as.data.frame(r$coef_tbl)))
+write_parquet(m2_xgb_importance, file.path(out_output, "m2_xgb_importance.parquet"))
+
+m2_log_coefs <- bind_rows(lapply(
+  Filter(function(r) r$model_type == "logistic", m2_results),
+  function(r) as.data.frame(r$coef_tbl)))
+write_parquet(m2_log_coefs, file.path(out_output, "m2_log_coefs.parquet"))
+
+m2_cal_data <- bind_rows(lapply(m2_results, function(r) {
+  if (is.null(r$calibration)) return(NULL)
+  r$calibration %>% mutate(
+    cohort       = r$cohort,  juncture    = r$juncture,
+    feature_mode = r$feature_mode, model_type = r$model_type)
+}))
+write_parquet(m2_cal_data, file.path(out_output, "m2_cal_data.parquet"))
+```
+
+```{r sensitivity-run-m2, eval = FALSE}
+# 
+# SENSITIVITY ANALYSIS  stratify by PGHD data completeness (Wk04 miss days)
+# High quality: avg missing days/week < 2; Low quality: >= 2 missing
+# 
+junc_all_sa <- open_dataset(file.path(out_output, "junc_all.parquet")) %>% collect()
+
+quality_strata <- junc_all_sa %>%
+  filter(juncture == "Wk04") %>%
+  select(PatientICN, k_steps_7d_miss_days) %>%
+  mutate(data_quality = if_else(
+    !is.na(k_steps_7d_miss_days) & k_steps_7d_miss_days < 2, "High", "Low"))
+
+cohort_data_sa <- list(
+  High = junc_all_sa %>%
+    semi_join(quality_strata %>% filter(data_quality == "High"), by = "PatientICN"),
+  Low  = junc_all_sa %>%
+    semi_join(quality_strata %>% filter(data_quality == "Low"),  by = "PatientICN"))
+
+sa_results <- list()
+for (stratum in c("High","Low")) {
+  df_stratum <- cohort_data_sa[[stratum]]
+  for (junc in juncture_labels_vec) {
+    for (fm in feature_sets) {
+      for (mt in model_types) {
+        res <- tryCatch({
+          df <- df_stratum %>% filter(juncture == junc)
+          if (nrow(df) == 0L) next
+
+          avail_step   <- intersect(step_cols_m2,       names(df))
+          avail_static <- intersect(static_cols_m2_all, names(df))
+          keep_feats <- switch(fm,
+            model1_steps_only       = avail_step,
+            model2_static_only      = avail_static,
+            model3_steps_and_static = union(avail_step, avail_static),
+            NULL)
+          if (is.null(keep_feats) || length(keep_feats) == 0L) next
+
+          tr <- df %>%
+            filter(PatientICN %in% train_pts_m2) %>%
+            select(PatientICN, Y, all_of(keep_feats)) %>% filter(!is.na(Y))
+          te <- df %>%
+            filter(PatientICN %in% test_pts_m2) %>%
+            select(Y, all_of(keep_feats)) %>% filter(!is.na(Y)) %>% as.data.frame()
+          if (sum(tr$Y) < 5 || sum(te$Y) < 5) next
+
+          rec  <- make_recipe_glmnet(as.data.frame(tr %>% select(-PatientICN)))
+          prp  <- prep(rec,
+            training = as.data.frame(tr %>% select(-PatientICN)), retain = TRUE)
+          fit  <- suppressWarnings(glm(Y ~ .,
+            data = bake(prp, new_data = as.data.frame(tr %>% select(-PatientICN))),
+            family = binomial()))
+          pred <- predict(fit,
+            newdata = bake(prp, new_data = te), type = "response")
+          m    <- compute_global_metrics(as.integer(te$Y), pred)
+
+          tibble(stratum = stratum, juncture = junc,
+                 feature_mode = fm,  model_type = mt,
+                 auc          = round(m$auc,    4),
+                 pr_auc       = round(m$pr_auc, 4),
+                 brier        = round(m$brier,  5),
+                 n_test       = length(te$Y),
+                 events_test  = sum(as.integer(te$Y)))
+        }, error = function(e) NULL)
+        if (!is.null(res)) sa_results <- append(sa_results, list(res))
+      }
+    }
+  }
+}
+
+sa_summaries_m2 <- bind_rows(sa_results)
+write_parquet(sa_summaries_m2, file.path(out_output, "sa_summaries_m2.parquet"))
+writexl::write_xlsx(as.data.frame(sa_summaries_m2),
+  file.path(out_data, "Table_SA_sensitivity_m2.xlsx"))
+```
+
+
+```{r load-precomputed, include = FALSE}
+# 
+# FAST RELOAD  reads all pre-computed Study 2 parquet / xlsx outputs.
+# Run the eval=FALSE chunks above once to generate these files, then re-render
+# with those chunks staying eval=FALSE; this chunk restores every object needed
+# by the display sections below.
+# 
+
+#  Inline parameters 
+inline_params_m2 <- arrow::read_parquet(file.path(out_output, "inline_params_m2.parquet"))
+list2env(as.list(inline_params_m2), envir = .GlobalEnv)
+
+#  CONSORT counts 
+consort_counts_m2 <- arrow::read_parquet(file.path(out_output, "consort_counts_m2.parquet"))
+list2env(as.list(consort_counts_m2), envir = .GlobalEnv)
+
+#  Model performance 
+m2_summaries <- arrow::read_parquet(file.path(out_output, "m2_summaries.parquet"))
+sa_summaries_m2 <- arrow::read_parquet(file.path(out_output, "sa_summaries_m2.parquet"))
+m2_cal_data  <- arrow::read_parquet(file.path(out_output, "m2_cal_data.parquet"))
+
+#  Patient-level and cohort data 
+patient_summary_m2 <- arrow::read_parquet(file.path(out_output, "patient_summary_m2.parquet")) %>%
+  mutate(
+    discharge_date   = as.Date(discharge_date),
+    index_event_type = factor(index_event_type, levels = c("ED","Inpatient")),
+    first_event_type = factor(first_event_type,
+      levels = c("Death","Inpatient Readmission","ED Return","No Event"))
+  )
+
+tbl1_data_m2 <- arrow::read_parquet(file.path(out_output, "tbl1_data_m2.parquet")) %>%
+  mutate(
+    across(
+      c(Gender, Race, Ethnicity, MaritalStatus, PriorityGroup, mst_status, tobacco_status),
+      ~ {
+        x <- iconv(gsub(".", " ", as.character(.x), fixed = TRUE), to = "UTF-8", sub = "")
+        factor(tools::toTitleCase(tolower(x)))
+      }),
+    GISURH = relevel(factor(dplyr::recode(toupper(trimws(as.character(GISURH))),
+      "H" = "Highly Rural", "I" = "Insular", "R" = "Rural", "U" = "Urban",
+      .default = "Unknown")), ref = "Urban"),
+    MaritalStatus    = relevel(factor(MaritalStatus), ref = "Married"),
+    index_event_type = factor(index_event_type, levels = c("ED","Inpatient")),
+    first_event_type = factor(first_event_type,
+      levels = c("Death","Inpatient Readmission","ED Return","No Event")),
+    had_event        = as.integer(first_event_type != "No Event"),
+    py_ed            = factor(py_ed),
+    py_urgent        = factor(py_urgent)
+  )
+
+#  Model component data for figures 
+m2_roc_data_wk04   <- arrow::read_parquet(file.path(out_output, "m2_roc_data_wk04.parquet"))
+m2_xgb_importance  <- arrow::read_parquet(file.path(out_output, "m2_xgb_importance.parquet"))
+m2_log_coefs       <- arrow::read_parquet(file.path(out_output, "m2_log_coefs.parquet"))
+
+# Study-1 compatibility stubs (Methods / CONSORT text update pending) 
+max_follow_up_days        <- max_pd_window    # 90 post-discharge days
+max_horizon               <- outcome_horizon  # 30 days
+n4_pts                    <- n3_pts           # patients with >=1 Wk01 snapshot
+n4_wks                    <- NA_integer_      # no weekly count in Study 2
+n4_before                 <- NA_integer_
+n4_removed_early_event    <- NA_integer_
+n4_removed_sparse_window  <- NA_integer_
+n0_wks                    <- NA_integer_
+n1_wks                    <- NA_integer_
+n2_wks                    <- NA_integer_
+n3_wks                    <- NA_integer_
+n_pdays_with_steps        <- NA_integer_
+pct_fitgarmin             <- NA_real_
+```
+
+
+---
+
+# Methods
+
+## Data
+
+This study uses Patient-Generated Health Data (PGHD) from the VA Wearable Technology Program, in which Veterans voluntarily enrolled and shared wearable device data (Fitbit, Garmin, or Apple Health). Data were obtained from **`r data_start_date`** through **`r data_end_date`**. Daily step counts from Fitbit and Garmin devices were prioritized (using the higher value when both were present); Apple Health data served as an alternative when Fitbit/Garmin data were unavailable. A total of `r format(n_pdays_with_steps, big.mark = ",")` patient-days had usable step data; Fitbit/Garmin data were available for `r pct_fitgarmin`% and Apple Health for the remainder. Daily step counts of zero were treated as missing, and outliers were removed using the 1.5"”IQR method applied to raw device columns. Where step data were missing but exercise duration (minutes) was recorded, steps were imputed from a linear regression model fit on matched days (`steps ~ exercise_minutes`).
+
+## Cohort Derivation (Figure 1)
+
+The analytic cohort was drawn from Veterans with PGHD records available from **`r data_start_date`** through **`r data_end_date`** (Step 0: N = `r format(n0_pts, big.mark=",")`). We then restricted to patients with first PGHD upload between **`r data_start_date`** and **`r followup_cutoff_label`** (Step 1), where the upper bound is set to preserve full 30-day outcome ascertainment before the data extract end date. Weekly rows were required to have at least one day of step data (Step 2: `k_steps_7d_miss_days <= 6`). No minimum baseline-duration requirement was applied in Study 2; all Step-2 qualifying person-weeks were retained before censoring (Step 3). Observation windows were censored at the first composite event or at `r max_follow_up_days %/% 7L` weeks after first upload, whichever came first (Step 4). The final analytic cohort included **`r format(n4_pts, big.mark=",")` Veterans** contributing **`r format(n4_wks, big.mark=",")` person-weeks** of observation.
+
+## Step Feature Construction
+
+At each observation week, a suite of step-derived features was computed from the 7-day, 14-day, and 21-day rolling windows anchored to the calendar week end-date. The primary current-activity features include the 7-day rolling average daily step count (`k_steps_7d_avg`, thousands), the rolling standard deviation (`k_steps_7d_sd`), the number of missing days in the window (`k_steps_7d_miss_days`), and the count of days with fewer than 1,000 steps (`low_activity_days_7d`). A temporal change metric captures short-term trend: percent change from the average of the prior three 7-day windows (`k_steps_7d_avg_pctdiff`, winsorized at plus or minus 500%). Analogous 14-day and 21-day rolling averages and standard deviations provide longer-horizon smoothed signals.
+
+## Outcome Definition
+
+The primary outcome was a composite of ED visit, inpatient admission, or death occurring within the prediction horizon ($h$ = 14 or 30 days) following a given observation week's end date. The outcome was labeled positive ($Y = 1$) if any component occurred within 1 to $h$ days (`days_to_event` $\in [1, h]$), and negative ($Y = 0$) otherwise. For each prediction horizon $h$, observation weeks for non-event patients were excluded if fewer than $h$ days remained before the end of the patient's observation window, as the outcome classification could not be confirmed over the full horizon. This ensures that 14-day models retain more person-weeks than 30-day models for the same patients.
+
+## Statistical Analysis
+
+We fit three feature sets: (1) step-derived features only; (2) static clinical features only (demographics, comorbidity flags, prior healthcare utilization, vitals, labs, and social history); and (3) the combined set. For each feature set and each prediction horizon (14-day and 30-day), we trained two algorithm types: penalized logistic regression (with elastic-net preprocessing) and gradient-boosted trees (XGBoost). Patients were randomly assigned to training (70%) and testing (30%) sets; all observation-weeks for a given patient remained in the same partition. To address class imbalance, logistic regression models were trained on patient-level 3:1 undersampled data; XGBoost models were trained on the full (non-undersampled) training data with `scale_pos_weight` set to the true negative-to-positive ratio, avoiding the probability compression that results from training and scoring on different class distributions.
+
+To ensure accurate absolute risk estimates, predicted probabilities were calibrated using Platt scaling (logistic regression of observed outcomes on raw model log-odds). Calibration models were fit on a held-out 20% of training patients (patient-level split, preserving the original class distribution) and applied to the independent test set, ensuring no test-set information was used to fit the calibration model. All discrimination and calibration metrics were computed on the Platt-calibrated test-set probabilities. Model performance was evaluated using the Area Under the Receiver Operating Characteristic Curve (AUC-ROC), the Area Under the Precision-Recall Curve (PR-AUC), the post-calibration slope (target: 1.0), and the Brier Skill Score (BSS = 1 $-$ Brier/Brier$_{\text{null}}$, where Brier$_{\text{null}}$ = $\bar{p}(1-\bar{p})$). BSS accounts for the low baseline event rate (<3% per week): BSS = 0 indicates no improvement over a null model predicting the marginal event rate, and BSS = 1 indicates perfect probabilistic skill. The pre-calibration slope is additionally reported as a diagnostic of raw model output compression.
+
+To evaluate whether the primary model captures predictive signal from weeks with sparse device engagement, test-set predictions were stratified post-hoc by weekly data quality: "clean" weeks (0Ã¢â‚¬"3 missing days; greater than 4 days with step data) and "sparse" weeks (4Ã¢â‚¬"6 missing days; 1Ã¢â‚¬"3 days with step data). Discrimination and skill metrics (AUC, PR-AUC, BSS) were computed separately for each stratum without model refit, directly testing whether weeks with low device engagement (which may reflect pre-event health deterioration) are predicted as effectively as high-quality weeks.
+
+## Figure 1. Cohort Derivation
+
+```{r consort-table}
+consort_df <- tribble(
+  ~Step, ~Criterion, ~Patients, ~`Index Events`,
+  "0. All index events in raw file",
+    "All index hospital encounters (ED visits and inpatient admissions) in the preliminary index event file.",
+    format(n0_pts,  big.mark = ","), format(n0_evts, big.mark = ","),
+  "1. Date filter",
+    paste0("Restrict to discharges between ", data_start_date, " and ", followup_cutoff_label,
+           " to allow \u22651 full juncture snapshot within the data extract window."),
+    format(n1_pts,  big.mark = ","), format(n1_evts, big.mark = ","),
+  "2. PGHD data present post-discharge",
+    paste0("\u22651 day with a PGHD step upload in [discharge_date + 1, discharge_date + ", max_pd_window, "]."),
+    format(n2_pts,  big.mark = ","), "",
+  "3. \u22651 Wk01 juncture snapshot",
+    paste0("Patient has a valid step snapshot at the Wk01 post-discharge juncture ",
+           "(days 1\u20137 post-discharge with non-missing step rolling average). ",
+           "ED: n = ", format(n3_pts_ed, big.mark = ","), "; ",
+           "Inpatient: n = ", format(n3_pts_inp, big.mark = ","), "."),
+    format(n3_pts,  big.mark = ","), ""
+)
+```
+```{r}
+consort_df %>%
+  gt() %>%
+  tab_header(title = html("Figure 1. Cohort derivation flow table for Study 2.")) %>%
+  cols_align(align = "left",  columns = c(Step, Criterion)) %>%
+  cols_align(align = "right", columns = c(Patients, `Index Events`)) %>%
+  cols_width(
+    Step            ~ px(288),
+    Criterion       ~ px(480),
+    Patients        ~ px(112),
+    `Index Events`  ~ px(112)
+  ) %>%
+  tab_options(table.font.size = px(12), table.width = "auto")
+```
+
+---
+
+## Cohort Derivation Diagnostics
+
+The sections below inspect each CONSORT exclusion step to verify that exclusions are appropriate. These are computed by re-applying each filter in isolation from a snapshot of the weekly data (`dt_weekly_snapshot`) taken after rolling-feature construction but before any CONSORT filtering.
+
+```{r consort-diagnostics, include = FALSE, eval = T}
+# CONSORT DIAGNOSTICS - Study 1 diagnostic chunks; not applicable for Study 2.
+# Preserved for reference only.
+
+dt_wk  <- open_dataset("data/output/model2_study2/dt_weekly_snapshot.parquet") %>% 
+collect() %>% 
+as.data.table() %>%
+inner_join(junc_all %>% select(PatientICN) %>% distinct(), by = "PatientICN")
+
+# Distribution of first_upload_date for annotation
+
+step1_dist <- dt_wk %>%
+  as_tibble() %>%
+  distinct(PatientICN, .keep_all = TRUE) %>%
+  transmute(first_upload_date = as.Date(first_upload_date)) %>%
+  dplyr::count(month = lubridate::floor_date(first_upload_date, "month"), name = "n_patients")
+
+step1_dist   %>% write_parquet("data/output/model2_study2/consort_diag_step1_dist.parquet")
+rm(step1_dist)
+
+# 
+# Step 2 Sensitivity: weekly data quality (miss_days threshold)
+# Thresholds: require 7 days present  miss_days  6,5,4,3,2,1,0
+# 
+```
+
+```{r, include = FALSE, eval = T}
+# Apply step-1 primary first so counts are comparable to primary analysis
+dt_s1 <- dt_wk[first_upload_date < as.Date("2025-03-17")]
+
+step2_thresholds <- 0:6   # miss_days  this value
+step2_min_days   <- 7 - step2_thresholds  # days present required
+
+step2_diag <- map2_dfr(step2_thresholds, step2_min_days, function(thresh, min_d) {
+  kept <- dt_s1[k_steps_7d_miss_days <= thresh]
+  tibble(
+    miss_days_threshold = thresh,
+    days_required       = min_d,
+    label               = paste0("", thresh, " missing (", min_d, " days present)",
+                                 if_else(thresh == 6, " [current]", "")),
+    n_patients          = uniqueN(kept$PatientICN),
+    n_weeks             = nrow(kept),
+    pct_patients_retained = round(100 * uniqueN(kept$PatientICN) / uniqueN(dt_s1$PatientICN), 1),
+    pct_weeks_retained    = round(100 * nrow(kept) / nrow(dt_s1), 1)
+  )
+})
+
+# Distribution of miss_days across all rows (after step-1)
+step2_dist <- dt_s1 %>%
+  as_tibble() %>%
+  dplyr::count(miss_days = k_steps_7d_miss_days, name = "n_weeks") %>%
+  mutate(pct = round(100 * n_weeks / sum(n_weeks), 1))
+
+```
+
+```{r, include = FALSE, eval = T}
+# Step 4 Diagnostic: not applicable to Study 2 (post-discharge juncture design)
+# Preserved for reference only.
+
+pre4 <- open_dataset("data/output/model2_study2/dt_analysis_pre_step4.parquet") %>% collect() %>% as.data.table()
+pre4[, weekly_end_date    := as.Date(weekly_end_date)]
+pre4[, first_event_date   := as.Date(first_event_date)]
+pre4[, first_upload_date  := as.Date(first_upload_date)]
+pre4[, obs_window_end := as.Date(first_upload_date) + max_follow_up_days]
+
+pre4[, event_within_window := !is.na(first_event_date) & first_event_date <= obs_window_end + max_horizon]
+pre4[, censor_date := fifelse(
+  event_within_window,
+  as.character(first_event_date),
+  as.character(obs_window_end))]
+pre4[, censor_date := as.Date(censor_date)]
+pre4[, keep_row := weekly_end_date <= censor_date]
+
+# Summary: patients before vs after (should be same or very close)
+step4_patient_summary <- tibble(
+  stage          = c("Pre-step 5 (post-step 4 obs weeks)", "Post-step 5 (censored)"),
+  n_patients     = c(uniqueN(pre4$PatientICN),
+                     uniqueN(pre4[keep_row == TRUE]$PatientICN)),
+  n_weeks        = c(nrow(pre4), nrow(pre4[keep_row == TRUE])),
+  n_weeks_removed = c(NA_integer_, nrow(pre4[keep_row == FALSE]))
+)
+
+# Reason for row removal
+step4_removal_reason <- pre4[keep_row == FALSE] %>%
+  as_tibble() %>%
+  mutate(
+    removal_reason = case_when(
+      event_within_window ~ "Event censoring (row after first event)",
+      TRUE                ~ paste0(max_follow_up_days %/% 7L, "-week / end-of-window censoring")
+    )
+  ) %>%
+  dplyr::count(removal_reason, name = "n_weeks_removed")
+
+# Weekly_interval_index distribution for removed rows
+step4_removed_index_dist <- pre4[keep_row == FALSE] %>%
+  as_tibble() %>%
+  dplyr::count(weekly_interval_index, name = "n_removed") %>%
+  arrange(weekly_interval_index)
+
+# Distribution of days_to_event for event-censored rows
+step4_event_days_dist <- pre4[keep_row == FALSE & event_within_window == TRUE] %>%
+  as_tibble() %>%
+  transmute(
+    days_to_event_at_removal = as.integer(first_event_date - weekly_end_date)
+  )
+
+step4_patient_summary    %>% write_parquet("data/output/model2_study2/consort_diag_step4_summary.parquet")
+step4_removal_reason     %>% write_parquet("data/output/model2_study2/consort_diag_step4_reason.parquet")
+step4_removed_index_dist %>% write_parquet("data/output/model2_study2/consort_diag_step4_index.parquet")
+step4_event_days_dist    %>% write_parquet("data/output/model2_study2/consort_diag_step4_event_days.parquet")
+rm(pre4, step4_patient_summary, step4_removal_reason, step4_removed_index_dist, step4_event_days_dist)
+```
+
+### Step 1: Distribution of first PGHD upload date by month
+
+```{r diag-step1-chart, echo=FALSE, fig.height=3.5, fig.cap="Distribution of first PGHD upload date by month. Vertical lines mark the three cutoff options. Patients to the right of a cutoff are excluded at Step 1."}
+if (file.exists("data/output/model2_study2/consort_diag_step1_dist.parquet")) {
+  d1_dist <- open_dataset("data/output/model2_study2/consort_diag_step1_dist.parquet") %>% collect()
+  # column is 'n_patients' if regenerated, or 'n' from older runs - handle both
+  if (!"n_patients" %in% names(d1_dist) && "n" %in% names(d1_dist))
+    d1_dist <- d1_dist %>% rename(n_patients = n)
+  .cutoff_cur <- as.Date(followup_cutoff)
+  cutoff_lines <- tibble(
+    cutoff = c(.cutoff_cur - 182, .cutoff_cur, .cutoff_cur + 184),
+    label  = c("-6 mo","Current","+ 6 mo")
+  )
+  ggplot(d1_dist, aes(x = month, y = n_patients)) +
+    geom_col(fill = "#4575b4", alpha = 0.75) +
+    geom_vline(data = cutoff_lines, aes(xintercept = as.numeric(cutoff), linetype = label),
+               color = c("#d73027","#1a1a1a","#69b3a2"), linewidth = 0.7) +
+    scale_linetype_manual(values = c("Current"="solid","-6 mo"="dashed","+ 6 mo"="dotdash"),
+                          name = "Cutoff") +
+    labs(x = "First upload month", y = "Patients",
+         title = "Step 1: Distribution of first PGHD upload date") +
+    theme_science() +
+    theme(legend.position = "right", legend.text = element_text(size = 8))
+}
+```
+
+---
+
+### Step 2: Weekly Data Quality Threshold Sensitivity
+
+```{r diag-step2, echo=FALSE}
+  d2      <- step2_diag
+  d2_dist <- step2_dist
+
+  d2 %>%
+    select(-miss_days_threshold, -days_required) %>%
+    setNames(c("Quality criterion", "Patients", "Person-weeks",
+               "% patients retained", "% weeks retained")) %>%
+    gt() %>%
+    tab_header(title = "Step 2 Sensitivity: Effect of varying the required minimum upload days per 7-day window.") %>%
+    cols_align(align = "left",  columns = `Quality criterion`) %>%
+    cols_align(align = "right", columns = c(Patients, `Person-weeks`, `% patients retained`, `% weeks retained`)) %>%
+    tab_options(table.font.size = px(12), table.width = "auto")
+```
+
+```{r diag-step2-chart, echo=FALSE, fig.height=3.5, fig.cap="Distribution of missing days per 7-day window across all qualifying person-weeks (after Step 1). The current threshold retains miss_days  6) retains."}
+if (file.exists("data/output/model2_study2/consort_diag_step2_dist.parquet")) {
+  d2_dist <- open_dataset("data/output/model2_study2/consort_diag_step2_dist.parquet") %>% collect()
+  ggplot(d2_dist %>% filter(!is.na(miss_days)),
+         aes(x = factor(miss_days), y = n_weeks)) +
+    geom_col() +
+    geom_text(aes(label = paste0(pct, "%")), vjust = -0.3, size = 2.8) +
+    labs(x = "Missing days in 7-day window", y = "Person-weeks",
+         title = "Step 2: Distribution of missing days per week") +
+    scale_y_continuous() +
+    theme_science() +
+    theme(legend.position = "top")
+}
+```
+
+---
+
+
+
+
+```{r diag-step5-charts, echo=FALSE, fig.height=4.5, fig.cap="Left: Distribution of weekly_interval_index for removed person-weeks (weeks dropped by censoring). Right: Distribution of days_to_event at the time of removal for event-censored rows (i.e., how far in the future was the event relative to the dropped week?)."}
+if (all(file.exists(c("data/output/model2_study2/consort_diag_step4_index.parquet",
+                       "data/output/model2_study2/consort_diag_step4_event_days.parquet")))) {
+  d4_idx   <- open_dataset("data/output/model2_study2/consort_diag_step4_index.parquet")      %>% collect()
+  d4_evtd  <- open_dataset("data/output/model2_study2/consort_diag_step4_event_days.parquet") %>% collect()
+
+  p_idx <- ggplot(d4_idx, aes(x = weekly_interval_index, y = n_removed)) +
+    geom_col(fill = "#d73027", alpha = 0.8) +
+    labs(x = "Week index (since first upload)", y = "Weeks removed",
+         title = "Removed weeks by week index") +
+    theme_science()
+
+  p_evtd <- ggplot(d4_evtd %>% filter(!is.na(days_to_event_at_removal)),
+                   aes(x = days_to_event_at_removal)) +
+    geom_histogram(binwidth = 7, fill = "#4575b4", alpha = 0.8, color = "white") +
+    labs(x = "Days from dropped week to first event", y = "Person-weeks",
+         title = "Event-censored: proximity to event") +
+    theme_science()
+
+  p_idx + p_evtd
+}
+```
+
+---
+
+# Results: Study 2 - Post-Discharge PGHD Cohort
+
+## Table 1. Sample Characteristics
+
+```{r table1, echo=FALSE}
+# tbl1_data_m2 is already loaded from load-precomputed chunk
+#  Save Table 1 underlying data to xlsx 
+writexl::write_xlsx(as.data.frame(tbl1_data_m2),
+                    file.path(out_data, "s2_Table1_cohort_characteristics.xlsx"))
+
+# Determine which py2_ columns are actually present
+py2_cols <- names(tbl1_data_m2)[str_detect(names(tbl1_data_m2), "^py2_")]
+
+#  Explicit variable groups (controls ordering and group headers) 
+grp_pghd <- character(0)  # No pre-discharge PGHD aggregate in Study 2
+
+grp_can <- intersect(
+  c("Age", "Gender", "Race", "Ethnicity", "MaritalStatus", "GISURH", "PriorityGroup", "season",
+    py2_cols, "cci_score",
+    "py_ed", "py_urgent", "py_appt_no_show",
+    "bmi_fitted_mean", "map_fitted_mean", "recent_pulse",
+    "bun_value_mean", "albumin_value_mean", "leuk_value_mean",
+    "mst_status", "current_smoker", "never_smoker"),
+  names(tbl1_data_m2))
+
+grp_events <- intersect(
+  c("had_event", "had_event_30d", "days_to_event", "first_event_type"),
+  names(tbl1_data_m2))
+
+tbl1_vars <- c(grp_pghd, grp_can, grp_events)
+
+# Continuous py2_ variables - kept numeric, not coerced to factor
+py2_continuous <- c("py2_mwi_score", "py2_IVC_los", "py2_IVC_n")
+
+py2_label_map <- c(
+  py2_acute_renal_failure      = "Acute renal failure (2yr)",
+  py2_artificial_openings      = "Artificial opening / ostomy (2yr)",
+  py2_chronic_pancreatitis     = "Chronic pancreatitis (2yr)",
+  py2_chronic_ulcer_skin       = "Chronic skin ulcer (2yr)",
+  py2_congestive_heart_failure = "Congestive heart failure (2yr)",
+  py2_drug_alcohol_dependence  = "Substance use disorder (2yr)",
+  py2_drug_alcohol_psychosis   = "Substance-induced psychosis (2yr)",
+  py2_lung_severe_cancers      = "Lung / severe cancer (2yr)",
+  py2_metastatic_cancer        = "Metastatic cancer (2yr)",
+  py2_pregnancy                = "Pregnancy (2yr)",
+  py2_heart_arrhythmias        = "Cardiac arrhythmia (2yr)",
+  py2_financial_sdoh           = "Financial hardship / SDOH (2yr)",
+  py2_housing_instability      = "Housing instability (2yr)",
+  py2_nonspecific_psychosocial = "Nonspecific psychosocial problem (2yr)",
+  py2_dialysis_access          = "Dialysis access procedure (2yr)",
+  py2_dialysis_status          = "Dialysis status (2yr)",
+  py2_mwi_score                = "Multimorbidity Weighted Index score (2yr)",
+  py2_IVC_n                    = "Community care stays, count (among admitted, 2yr)",
+  py2_IVC_los                  = "Community care, total LOS days (among admitted, 2yr)",
+  py2_IVC                      = "Community care stays, any (2yr)",
+
+  py2_inpat_any                = "Any inpatient admission (2yr)",
+  py2_inpat_med_surg           = "Med/surgical admission (2yr)",
+  py2_inpat_mental_health      = "Mental health admission (2yr)",
+  py2_inpat_nursing_home       = "Nursing home admission (2yr)",
+  py2_inpat_other              = "Other inpatient admission (2yr)"
+)
+base_label_map <- list(
+  Age                      = "Age (years)",
+  Gender                   = "Sex",
+  Race                     = "Race",
+  Ethnicity                = "Ethnicity",
+  MaritalStatus            = "Marital status",
+  GISURH                   = "Rural/Urban (GISURH)",
+  PriorityGroup            = "VA Priority Group",
+  season                   = "Season of discharge",
+  py_ed                    = "Any ED visit (prior year)",
+  py_urgent                = "Any urgent care (prior year)",
+  py_appt_no_show          = "Appointment no-show (prior year)",
+  bmi_fitted_mean          = "BMI (spline-fitted mean)",
+  map_fitted_mean          = "MAP (spline-fitted mean, mmHg)",
+  recent_pulse             = "Recent pulse (bpm)",
+  bun_value_mean           = "BUN (mean, mg/dL)",
+  albumin_value_mean       = "Albumin (mean, g/dL)",
+  leuk_value_mean          = "Leukocytes (mean, 10^3/\u00b5L)",
+  cci_score                = "Charlson Comorbidity Index (CCI) score",
+  mst_status               = "Military sexual trauma",
+  current_smoker           = "Current smoker",
+  never_smoker             = "Never smoker",
+  had_event                = "Had any composite event (follow-up)",
+  had_event_30d            = "Had composite event within 30 days of discharge",
+  days_to_event            = "Days from discharge to first event",
+  first_event_type         = "First composite event type"
+)
+all_labels    <- c(as.list(py2_label_map), base_label_map)
+present_labels <- all_labels[intersect(names(all_labels), tbl1_vars)]
+
+# Mark reference groups & convert NA  "Unknown" for categorical display 
+mark_ref <- function(x, ref_lv = NULL) {
+  # Strip any prior "(ref)" tags so the function is idempotent across re-runs
+  x_chr <- gsub(" \\(ref\\)$", "", as.character(x))
+  x <- factor(x_chr)
+  if (is.null(ref_lv)) ref_lv <- levels(x)[1]
+  new_lv <- c(paste0(ref_lv, " (ref)"), setdiff(levels(x), c(ref_lv, "Unknown")), "Unknown")
+  x_chr[is.na(x_chr)] <- "Unknown"
+  x_chr[x_chr == ref_lv] <- paste0(ref_lv, " (ref)")
+  factor(x_chr, levels = new_lv)
+}
+tbl1_data_m2 <- tbl1_data_m2 %>%
+  mutate(
+    Gender         = mark_ref(Gender),
+    Race           = mark_ref(Race, "White"),
+    Ethnicity      = mark_ref(Ethnicity, "Not Hispanic or Latino"),
+    MaritalStatus  = mark_ref(MaritalStatus, "Married"),
+    GISURH         = mark_ref(GISURH, "Urban"),
+    PriorityGroup  = mark_ref(PriorityGroup, "Group 1"),
+    mst_status     = mark_ref(mst_status),
+    tobacco_status = mark_ref(tobacco_status)
+  )
+
+tbl_obj <- tbl1_data_m2 %>%
+  select(index_event_type, all_of(tbl1_vars)) %>%
+  tbl_summary(
+    by      = index_event_type,
+    missing = "ifany",
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd}); {median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(all_continuous() ~ 1),
+    label  = present_labels
+  )
+
+# Add visual section headers - requires gtsummary >= 2.0; falls back gracefully
+tbl_obj <- tryCatch(
+  tbl_obj %>%
+    add_variable_group_header(
+      list(
+        "CAN-Score Analog Clinical Features"  = grp_can,
+        "Event Variables"                     = grp_events
+      )
+    ),
+  error = function(e) tbl_obj
+)
+
+tbl1_display <- tbl_obj %>%
+  add_overall(last = FALSE) %>%
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 2)) %>%
+  bold_labels() %>%
+  modify_caption(
+    "**Table 1. Sample characteristics by index event type (ED vs. Inpatient).** Variables grouped as: (1) CAN-Score Analog Clinical Features, (2) Event Variables. Continuous: mean (SD); median (IQR); categorical: N (%). p-values from Kruskal-Wallis (continuous) or \u03c7\u00b2 (categorical) tests."
+  )
+tbl1_display
+```
+
+```{r table1-download, echo=FALSE}
+if (requireNamespace("downloadthis", quietly = TRUE)) {
+  gtsummary::as_tibble(tbl1_display) %>%
+    downloadthis::download_this(
+      output_name      = "Table1_cohort_characteristics",
+      output_extension = ".xlsx",
+      button_label     = "Download Table 1 data (xlsx)",
+      button_type      = "default",
+      class            = "btn-sm"
+    )
+}
+```
+
+---
+
+## Figure 2. Time to First Composite Event
+
+```{r fig2-survival, echo=FALSE, fig.height=4.5, fig.cap="Figure 2. Kaplan-Meier survival curves for time from discharge to first composite post-discharge event (ED return, inpatient readmission, or death), stratified by index event type (ED vs. Inpatient). Tick marks indicate censored observations. Shaded bands represent 95% pointwise confidence intervals."}
+if (!requireNamespace("survival", quietly = TRUE))
+  try(install.packages("survival", repos = "https://cloud.r-project.org", quiet = TRUE), silent = TRUE)
+library(survival)
+
+km_data_m2 <- patient_summary_m2 %>%
+  mutate(
+    surv_time  = pmax(
+      if_else(!is.na(first_event_date),
+              as.numeric(difftime(first_event_date, discharge_date, units = "days")),
+              pmin(as.numeric(difftime(obs_end, discharge_date, units = "days")),
+                   as.numeric(max_pd_window))),
+      0),
+    event_flag = as.integer(!is.na(first_event_date)),
+    index_event_type = factor(index_event_type, levels = c("ED", "Inpatient"))
+  ) %>%
+  filter(!is.na(surv_time), surv_time >= 0, !is.na(index_event_type))
+
+km_fit_m2 <- survfit(Surv(surv_time, event_flag) ~ index_event_type, data = km_data_m2)
+
+km_df_m2 <- data.frame(
+  time    = km_fit_m2$time,
+  surv    = km_fit_m2$surv,
+  lower   = km_fit_m2$lower,
+  upper   = km_fit_m2$upper,
+  n.cens  = km_fit_m2$n.censor,
+  strata  = rep(names(km_fit_m2$strata), km_fit_m2$strata)
+) %>%
+  mutate(Cohort = str_remove(strata, "index_event_type="))
+
+n_events_m2 <- sum(km_data_m2$event_flag)
+n_total_m2  <- nrow(km_data_m2)
+
+ggplot(km_df_m2 %>% filter(time <= max_pd_window), aes(x = time, y = surv, color = Cohort)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = Cohort), alpha = 0.12, color = NA) +
+  geom_step(linewidth = 0.7) +
+  geom_point(data = km_df_m2 %>% filter(n.cens > 0, time <= max_pd_window),
+             aes(x = time, y = surv), shape = 3, size = 1.0, alpha = 0.5) +
+  scale_color_manual(values = c("ED" = "#d73027", "Inpatient" = "#4575b4"), name = "Index event") +
+  scale_fill_manual( values = c("ED" = "#d73027", "Inpatient" = "#4575b4"), name = "Index event") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0.5, 1), expand = c(0, 0)) +
+  scale_x_continuous(breaks = seq(0, max_pd_window, by = 30), expand = c(0.01, 0)) +
+  labs(x = "Days from discharge",
+       y = "Proportion event-free",
+       title = NULL) +
+  theme_science(base_size = 9) +
+  theme(legend.position  = "right",
+        legend.text      = element_text(size = 8),
+        legend.title     = element_text(size = 8),
+        panel.grid.major.y = element_line(colour = "grey92", linewidth = 0.3)) -> p_km_m2
+
+ggsave(file.path(out_figures, "Figure_2_KM_postdischarge.png"),
+       plot = p_km_m2, width = 9, height = 4.5, dpi = 300, bg = "white")
+p_km_m2
+```
+
+---
+
+## Figure 3. Step Trajectories Before First Event
+
+```{r fig-trajectory-m2, echo=FALSE, fig.height=6, fig.cap="Figure 3. Mean daily step count (Ã‚Â± 1 SE) in the first 90 days post-discharge, by 30-day outcome group (event vs. no event) and index event type. Smoothed using a 7-day rolling mean for display. n shown per group at day 7."}
+pd_labeled_disp <- arrow::open_dataset(
+  file.path(out_output, "pd_daily_labeled.parquet")) %>%
+  collect() %>%
+  mutate(
+    date            = as.Date(date),
+    discharge_date  = as.Date(discharge_date)
+  ) %>%
+  filter(discharge_date >= inception_cutoff_m2,
+         days_post_discharge >= 1,
+         days_post_discharge <= 90,
+         label_valid == 1L) %>%
+  mutate(
+    outcome_group    = if_else(Y_30d == 1L, "Event (30d)", "No Event"),
+    index_event_type = factor(index_event_type, levels = c("ED","Inpatient"))
+  )
+
+traj_m2 <- pd_labeled_disp %>%
+  group_by(index_event_type, outcome_group, days_post_discharge) %>%
+  summarise(
+    mean_steps = mean(daily_steps, na.rm = TRUE),
+    se_steps   = sd(daily_steps,   na.rm = TRUE) / sqrt(dplyr::n()),
+    n_pts      = n_distinct(PatientICN),
+    .groups = "drop"
+  )
+
+p_traj_m2 <- ggplot(traj_m2 %>% filter(!is.na(mean_steps)),
+       aes(x = days_post_discharge, y = mean_steps,
+           color = outcome_group, fill = outcome_group)) +
+  geom_ribbon(aes(ymin = mean_steps - se_steps, ymax = mean_steps + se_steps),
+              alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.7) +
+  scale_color_manual(values = c("Event (30d)" = "#d73027", "No Event" = "#69b3a2"),
+                     name = "Outcome") +
+  scale_fill_manual( values = c("Event (30d)" = "#d73027", "No Event" = "#69b3a2"),
+                     name = "Outcome") +
+  scale_x_continuous(breaks = seq(0, 90, by = 14)) +
+  facet_wrap(~index_event_type, ncol = 2, labeller = label_both) +
+  labs(x = "Days post-discharge", y = "Daily steps",
+       title = NULL) +
+  theme_science() +
+  theme(legend.position = "bottom",
+        legend.text    = element_text(size = 8),
+        legend.title   = element_text(size = 8),
+        strip.text     = element_text(face = "bold"))
+
+ggsave(file.path(out_figures, "Figure_3_step_trajectories_postdischarge.png"),
+       plot = p_traj_m2, width = 9, height = 5, dpi = 300, bg = "white")
+p_traj_m2
+```
+
+---
+
+## Table 2. Predictive Model Performance
+
+```{r table2, echo=FALSE}
+# Study 2 performance table: sub-tables by cohort, rows = featureÃ—algo, cols = juncture
+tbl2_base <- m2_summaries %>%
+  mutate(
+    feature_label = recode(feature_mode, !!!feat_labels),
+    algo          = dplyr::recode(model_type, xgboost = "XGBoost", logistic = "Logistic")
+  ) %>%
+  select(cohort, juncture, feature_label, algo,
+         auc, pr_auc, brier, cal_slope_post_platt, n_test, events_test) %>%
+  arrange(cohort, juncture, algo, feature_label)
+
+make_tbl2_subtable <- function(df, cohort_label) {
+  df_wide <- df %>%
+    pivot_wider(
+      id_cols     = c(feature_label, algo),
+      names_from  = juncture,
+      values_from = c(auc, pr_auc, brier, cal_slope_post_platt, n_test, events_test)
+    )
+
+  junc_labs <- juncture_labels_vec
+  col_spanners <- lapply(junc_labs, function(j) {
+    list(label   = j,
+         columns = any_of(paste0(c("auc","pr_auc","brier","cal_slope_post_platt","n_test","events_test"), "_", j)))
+  })
+
+  tbl_gt <- df_wide %>%
+    mutate(.grp = algo) %>%
+    select(-.grp, .grp = algo) %>%
+    select(-.grp, .grp) %>%
+    {
+      tmp <- (.)
+      tmp$.grp <- tmp$algo
+      select(tmp, -algo)
+    } %>%
+    gt(groupname_col = ".grp") %>%
+    cols_label(feature_label = "Feature set") %>%
+    sub_missing(missing_text = "--") %>%
+    fmt_number(columns = matches("^(auc|pr_auc|brier|cal_slope)"), decimals = 3) %>%
+    fmt_integer(columns = matches("^(n_test|events_test)")) %>%
+    tab_header(title = paste0("Table 2", if (cohort_label == "All") "" else paste0(" (", cohort_label, " cohort)"),
+                              ". Model performance (30% hold-out test set) "” ", cohort_label, " cohort.")) %>%
+    tab_source_note(source_note = html(paste0(
+      "<b>Note.</b> AUC = ROC-AUC; PR-AUC = precision-recall AUC; ",
+      "Brier = Brier score; Cal. slope = post-Platt calibration slope (target 1.0); ",
+      "n_test = test set observations; events_test = events in test set."
+    ))) %>%
+    tab_options(table.font.size = px(11), table.width = "auto")
+
+  for (.jl in junc_labs) {
+    tbl_gt <- tbl_gt %>%
+      tab_spanner(
+        label   = .jl,
+        columns = any_of(paste0(c("auc","pr_auc","brier","cal_slope_post_platt","n_test","events_test"), "_", .jl))
+      )
+  }
+  tbl_gt
+}
+
+for (.coh in c("All","ED","Inpatient")) {
+  df_coh <- tbl2_base %>% filter(cohort == .coh)
+  if (nrow(df_coh) > 0L) {
+    print(make_tbl2_subtable(df_coh, .coh))
+    cat("\n\n")
+  }
+}
+```
+
+```{r table2-download, echo=FALSE}
+if (requireNamespace("downloadthis", quietly = TRUE)) {
+  m2_summaries %>%
+    mutate(
+      feature_label = recode(feature_mode, !!!feat_labels),
+      algo = dplyr::recode(model_type, xgboost = "XGBoost", logistic = "Logistic")
+    ) %>%
+    downloadthis::download_this(
+      output_name      = "Table2_model_performance",
+      output_extension = ".xlsx",
+      button_label     = "Download Table 2 data (xlsx)",
+      button_type      = "default",
+      class            = "btn-sm"
+    )
+}
+```
+
+
+### Sensitivity Analyses
+
+```{r sensitivity-results, echo=FALSE, results='asis'}
+# Sensitivity B: stratified test-set performance by weekly data quality (30-day horizon)
+sa_30d <- sa_summaries_m2 %>%
+  mutate(
+    feature_label = recode(feature_mode, !!!feat_labels),
+    algo          = dplyr::recode(model_type, xgboost = "XGBoost", logistic = "Logistic")
+  ) %>%
+  select(feature_label, algo, stratum, n_test, events_test, auc, pr_auc) %>%
+  arrange(algo, feature_label, stratum)
+
+sa_logistic_rows <- which(sa_30d$algo == "Logistic")
+sa_xgboost_rows  <- which(sa_30d$algo == "XGBoost")
+
+kbl_sa <- sa_30d %>%
+  mutate(
+    .grp = dplyr::case_when(
+      algo == "Logistic" ~ "Logistic regression",
+      algo == "XGBoost"  ~ "XGBoost",
+      .default           = NA_character_
+    )
+  ) %>%
+  select(.grp, feature_label, stratum, n_test, events_test, auc, pr_auc) %>%
+  gt(groupname_col = ".grp") %>%
+  cols_label(
+    feature_label = "Feature set",
+    stratum       = "Data quality stratum",
+    n_test        = "Test N",
+    events_test   = "Events",
+    auc           = "AUC",
+    pr_auc        = "PR-AUC"
+  ) %>%
+  fmt_integer(columns = c(n_test, events_test)) %>%
+  fmt_number(columns  = c(auc, pr_auc), decimals = 4) %>%
+  cols_width(feature_label ~ px(192)) %>%
+  tab_header(title = html(paste0(
+    "Table S1. Sensitivity Analysis: Test-set performance stratified by data quality at Wk04. ",
+    "\u2018High quality\u2019: < 2 missing days (Wk04 k_steps_7d_miss_days < 2). ",
+    "\u2018Low quality\u2019: \u22652 missing days. ",
+    "No model refit - stratified evaluation within the primary model."
+  ))) %>%
+  tab_options(table.font.size = px(11), table.width = "auto")
+kbl_sa
+```
+
+```{r sensitivity-download, echo=FALSE}
+if (requireNamespace("downloadthis", quietly = TRUE)) {
+  sa_30d %>%
+    downloadthis::download_this(
+      output_name      = "Table_S1_sensitivity_analysis",
+      output_extension = ".xlsx",
+      button_label     = "Download Sensitivity Analysis data (xlsx)",
+      button_type      = "default",
+      class            = "btn-sm"
+    )
+}
+```
+
+
+## Table 3. Model Calibration: 14-Day and 30-Day Horizons
+
+```{r table3-calibration, echo=FALSE}
+cal_tbl_data <- m2_cal_data %>%
+  mutate(
+    feature_label  = recode(feature_mode, !!!feat_labels),
+    algo           = str_to_title(model_type),
+    juncture_label = juncture
+  )
+
+if (nrow(cal_tbl_data) > 0) {
+  cal_tbl_data %>%
+    mutate(
+      mean_predicted = round(mean_predicted, 3),
+      observed_rate  = round(observed_rate,  3),
+      n              = format(n,        big.mark = ","),
+      n_events       = format(n_events, big.mark = ",")
+    ) %>%
+    arrange(juncture_label, feature_label, algo, prob_bin) %>%
+    mutate(.grp = paste0(juncture_label, " - ", feature_label, " - ", algo)) %>%
+    select(
+      .grp,
+      `Predicted prob. bin` = prob_bin,
+      N                     = n,
+      `Events (n)`          = n_events,
+      `Mean predicted`      = mean_predicted,
+      `Observed rate`       = observed_rate
+    ) %>%
+    gt(groupname_col = ".grp") %>%
+    tab_header(title = "Table 3. Calibration table for post-discharge juncture models (Wk01-Wk04). Predicted probabilities are grouped into decile-based bins; observed event rates are compared to mean predicted probabilities within each bin. Well-calibrated models show observed rates close to mean predicted values.") %>%
+    cols_align(align = "left",  columns = `Predicted prob. bin`) %>%
+    cols_align(align = "right", columns = c(N, `Events (n)`, `Mean predicted`, `Observed rate`)) %>%
+    tab_options(
+      table.font.size       = px(11),
+      table.width           = "auto",
+      row_group.font.weight = "bold"
+    )
+} else {
+  cat("*Calibration data not available - ensure models have been fit.*")
+}
+```
+
+```{r table3-download, echo=FALSE}
+if (requireNamespace("downloadthis", quietly = TRUE) && nrow(cal_tbl_data) > 0) {
+  cal_tbl_data %>%
+    mutate(
+      feature_label  = recode(feature_mode, !!!feat_labels),
+      algo           = str_to_title(model_type),
+      juncture_label = juncture
+    ) %>%
+    select(
+      juncture_label, feature_label, algo,
+      prob_bin, n, n_events, mean_predicted, observed_rate
+    ) %>%
+    downloadthis::download_this(
+      output_name      = "Table3_calibration",
+      output_extension = ".xlsx",
+      button_label     = "Download Table 3 data (xlsx)",
+      button_type      = "default",
+      class            = "btn-sm"
+    )
+}
+```
+
+---
+
+## Figure 4. ROC Curves at Wk04 and AUC Trend by Juncture
+
+```{r fig4-roc-m2, echo=FALSE, fig.height=4.8, fig.cap="Figure 4. Left: ROC curves at Wk04 for logistic and XGBoost across feature sets. Right: AUC trend from Wk01 to Wk04 by model-feature combination and cohort."}
+# --- Left panel: ROC at Wk04 (all cohort) ---
+roc_wk04 <- m2_roc_data_wk04 %>%
+  mutate(
+    feature_label = recode(feature_mode, !!!feat_labels),
+    algo = recode(model_type, logistic = "Logistic", xgboost = "XGBoost"),
+    auc_label = sprintf("AUC = %.3f", auc_val)
+  )
+
+auc_annot_wk04 <- roc_wk04 %>%
+  group_by(algo, feature_label) %>%
+  slice(round(dplyr::n()/2)) %>%
+  ungroup()
+
+p_roc_wk04 <- ggplot(roc_wk04, aes(x = fpr, y = tpr, color = feature_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey60") +
+  facet_wrap(~algo) +
+  scale_color_manual(values = feat_colors, name = "Feature set") +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0,1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0,1)) +
+  ggrepel::geom_label_repel(
+    data = auc_annot_wk04,
+    aes(label = auc_label),
+    size = 2.3, box.padding = 0.25, show.legend = FALSE,
+    segment.size = 0.25
+  ) +
+  labs(x = "1 - Specificity", y = "Sensitivity", title = "ROC at Wk04") +
+  theme_science() +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+# --- Right panel: AUC trend by juncture and cohort ---
+auc_trend <- m2_summaries %>%
+  mutate(
+    juncture = factor(juncture, levels = 1:4, labels = juncture_labels_vec),
+    feature_label = recode(feature_mode, !!!feat_labels),
+    algo = recode(model_type, logistic = "Logistic", xgboost = "XGBoost"),
+    model_feat = paste(algo, "-", feature_label),
+    cohort_lbl = cohort
+  )
+
+p_auc_trend <- ggplot(auc_trend,
+                      aes(x = juncture, y = auc,
+                          color = cohort_lbl,
+                          group = interaction(model_feat, cohort_lbl),
+                          linetype = model_feat,
+                          shape = cohort_lbl)) +
+  geom_line(linewidth = 0.7, alpha = 0.9) +
+  geom_point(size = 2.0) +
+  scale_color_manual(values = cohort_colors, name = "Cohort") +
+  scale_y_continuous(limits = c(0.50, 0.95), breaks = seq(0.50, 0.95, 0.05)) +
+  labs(x = "Juncture", y = "AUC", title = "AUC Trend by Juncture") +
+  theme_science() +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7)
+  )
+
+p_fig4 <- p_roc_wk04 + p_auc_trend +
+  plot_layout(widths = c(1.1, 1), guides = "collect") &
+  theme(legend.position = "bottom")
+
+ggsave(file.path(out_figures, "Figure_4_ROC_Wk04_AUC_trend.png"),
+       plot = p_fig4, width = 10, height = 4.8, dpi = 300, bg = "white")
+p_fig4
+```
+
+---
+
+## Figure 5. XGBoost Feature Importance: Steps + Static Model
+
+```{r fig4-importance, echo=FALSE, fig.height=8, fig.cap="Figure 5. Top 20 XGBoost feature importances (Gain): Steps + Static, 14-Day and 30-Day Horizons. Bars filled by feature category (colorblind-friendly Set2 palette). Gain = fractional contribution to total information gain across all trees. Labels show Gain x 100."}
+# Shared label helper - used by this chunk and the logistic regression chunk
+feat_display_names <- c(
+  # PGHD / step features
+  k_steps_7d_avg               = "7-day avg. daily steps",
+  k_steps_7d_sd                = "7-day SD of daily steps",
+  k_steps_7d_miss_days         = "Missing days/week (7-day)",
+  k_steps_7d_avg_pctdiff       = "% change vs. prior 3-week avg.",
+  low_activity_days_7d         = "Low-activity days/week (7-day)",
+  low_activity_streak          = "Consecutive low-activity days",
+  k_steps_14d_avg              = "14-day avg. daily steps",
+  k_steps_14d_sd               = "14-day SD of daily steps",
+  k_steps_21d_avg              = "21-day avg. daily steps",
+  k_steps_21d_sd               = "21-day SD of daily steps",
+  # Vitals & labs
+  bmi_fitted_mean              = "BMI, fitted mean (kg/m\u00b2)",
+  bmi_slope                    = "BMI trend slope",
+  bmi_fitted_last              = "BMI, most recent fitted (kg/m\u00b2)",
+  map_fitted_mean              = "MAP, fitted mean (mmHg)",
+  map_fitted_last              = "MAP, most recent fitted (mmHg)",
+  map_slope                    = "MAP trend slope",
+  recent_pulse                 = "Heart rate, most recent (bpm)",
+  bun_value_mean               = "BUN, mean (mg/dL)",
+  bun_value_last               = "BUN, most recent (mg/dL)",
+  albumin_value_mean           = "Albumin, mean (g/dL)",
+  albumin_value_last           = "Albumin, most recent (g/dL)",
+  leuk_value_mean              = "WBC, mean (10\u00b3/\u00b5L)",
+  leuk_value_last              = "WBC, most recent (10\u00b3/\u00b5L)",
+  # Demographics
+  Age                          = "Age (years)",
+  # Gender (ref = Male)
+  gender_Female                = "Female (Male)",
+  gender_Unknown               = "Unknown Sex (Male)",
+  # Race (ref = White)
+  race_BlackOrAfricanAmerican  = "Black or African American (White)",
+  race_AmericanIndian          = "American Indian or Alaska Native (White)",
+  race_Asian                   = "Asian (White)",
+  race_PacificIslander         = "Native Hawaiian or Pacific Islander (White)",
+  race_Multiracial             = "Multiracial (White)",
+  race_Unknown                 = "Unknown Race (White)",
+  # Ethnicity (ref = Not Hispanic or Latino)
+  eth_HispanicOrLatino         = "Hispanic or Latino (Not Hispanic or Latino)",
+  eth_Unknown                  = "Unknown Ethnicity (Not Hispanic or Latino)",
+  # Marital status (ref = Married)
+  marital_Divorced             = "Divorced (Married)",
+  marital_NeverMarried         = "Never Married (Married)",
+  marital_Widowed              = "Widowed (Married)",
+  marital_Separated            = "Separated (Married)",
+  marital_Unknown              = "Unknown Marital Status (Married)",
+  # Rurality (ref = Urban)
+  gisurh_Rural                 = "Rural (Urban)",
+  gisurh_HighlyRural           = "Highly Rural (Urban)",
+  gisurh_Insular               = "Insular (Urban)",
+  gisurh_Unknown               = "Unknown Rurality (Urban)",
+  # VA Priority Group - individual groups (ref = Group 1)
+  pg_G2                        = "Priority Group 2 (Group 1)",
+  pg_G3                        = "Priority Group 3 (Group 1)",
+  pg_G4                        = "Priority Group 4 (Group 1)",
+  pg_G5                        = "Priority Group 5 (Group 1)",
+  pg_G6                        = "Priority Group 6 (Group 1)",
+  pg_G7                        = "Priority Group 7 (Group 1)",
+  pg_G8                        = "Priority Group 8 (Group 1)",
+  pg_Unknown                   = "Unknown Priority Group (Group 1)",
+  # Season (ref = Fall)
+  season_Spring                = "Spring (Fall)",
+  season_Summer                = "Summer (Fall)",
+  season_Winter                = "Winter (Fall)",
+  days_obs_remaining           = "Days remaining in follow-up",
+  # Healthcare utilization
+  py_ed                        = "ED visit, prior year",
+  py_urgent                    = "Urgent care visit, prior year",
+  py_appt_no_show              = "Appointment no-show, prior year",
+  py2_inpat_any                = "Any inpatient admission, 2-year",
+  py2_inpat_med_surg           = "Med./surgical admission, 2-year",
+  py2_inpat_mental_health      = "Mental health admission, 2-year",
+  py2_inpat_other              = "Other inpatient admission, 2-year",
+  py2_inpat_nursing_home       = "Nursing home admission, 2-year",
+  py2_IVC_n                    = "Community care stays, count (2-year)",
+  py2_IVC_los                  = "Community care LOS, days (2-year)",
+  py2_IVC                      = "Community care stay, any (2-year)",
+  py2_mwi_score                = "Multimorbidity Weighted Index (MWI)",
+  # Comorbidity flags
+  py2_congestive_heart_failure = "Congestive heart failure, 2-year",
+  py2_heart_arrhythmias        = "Cardiac arrhythmia, 2-year",
+  py2_drug_alcohol_dependence  = "Substance use disorder, 2-year",
+  py2_metastatic_cancer        = "Metastatic cancer, 2-year",
+  py2_lung_severe_cancers      = "Lung/severe cancer, 2-year",
+  py2_dialysis_status          = "Dialysis, 2-year",
+  py2_housing_instability      = "Housing instability, 2-year",
+  py2_financial_sdoh           = "Financial hardship, 2-year",
+  py2_acute_renal_failure      = "Acute renal failure, 2-year",
+  py2_artificial_openings      = "Artificial openings, 2-year",
+  py2_chronic_pancreatitis     = "Chronic pancreatitis, 2-year",
+  py2_chronic_ulcer_skin       = "Chronic skin/ulcer condition, 2-year",
+  py2_drug_alcohol_psychosis   = "Drug/alcohol-induced psychosis, 2-year",
+  py2_pregnancy                = "Pregnancy/peripartum condition, 2-year",
+  py2_nonspecific_psychosocial = "Nonspecific psychosocial condition, 2-year",
+  py2_dialysis_access          = "Dialysis access, 2-year",
+  cci_score                    = "Charlson Comorbidity Index (CCI)",
+  # Social history
+  mst_Yes                      = "Military Sexual Trauma: Yes (No)",
+  current_smoker               = "Current smoker",
+  never_smoker                 = "Never smoker"
+)
+
+  apply_feat_labels <- function(term_vec) {
+    # Cleans recipe-encoded level suffixes: replaces dots with spaces (e.g.
+    # "Black.or.African.American" -> "Black or African American") and converts
+    # all-uppercase strings to title case (e.g. "MALE" -> "Male").
+    clean_lv <- function(x) {
+      x <- gsub(".", " ", x, fixed = TRUE)
+      dplyr::if_else(x == toupper(x), tools::toTitleCase(tolower(x)), x)
+    }
+    # All labels are pre-defined in feat_display_names; fall back to raw column name
+    case_when(
+      term_vec %in% names(feat_display_names) ~ feat_display_names[term_vec],
+      TRUE ~ term_vec
+    )
+  }
+
+  # Load pre-computed XGBoost importance (saved in target block)
+  imp_combined <- m2_xgb_importance %>%
+    filter(feature_mode == "model3_steps_and_static") %>%
+    group_by(juncture) %>%
+    arrange(desc(gain)) %>%
+    slice_head(n = 20) %>%
+    ungroup() %>%
+    mutate(
+      juncture_label = factor(juncture, levels = juncture_labels_vec),
+      Category       = classify_feature(term),
+      Gain           = round(gain, 5),
+      Feature_label  = apply_feat_labels(term)
+    )
+
+  #  Save full XGBoost importance table (both horizons) to xlsx 
+  xgb_all_imp <- m2_xgb_importance %>%
+    mutate(Juncture = juncture) %>%
+    arrange(Juncture, desc(gain)) %>%
+    mutate(
+      Category      = classify_feature(term),
+      Feature_label = apply_feat_labels(term)
+    ) %>%
+    select(Juncture, Feature_label, Feature_raw = term, Category,
+           Gain = gain, Cover = cover, Frequency = frequency)
+  writexl::write_xlsx(xgb_all_imp, file.path(out_data, "s2_xgboost_feature_importance_junctures.xlsx"))
+
+  # Per-facet y-axis ordering via tidytext
+  if (!requireNamespace("tidytext", quietly = TRUE))
+    try(install.packages("tidytext", repos = "https://cloud.r-project.org", quiet = TRUE), silent = TRUE)
+  if (requireNamespace("tidytext", quietly = TRUE)) {
+    imp_combined <- imp_combined %>%
+      mutate(Feature_ord = tidytext::reorder_within(Feature_label, Gain, juncture_label))
+    y_scale_xgb <- tidytext::scale_y_reordered()
+  } else {
+    imp_combined <- imp_combined %>%
+      mutate(Feature_ord = reorder(Feature_label, Gain))
+    y_scale_xgb <- scale_y_discrete()
+  }
+
+  if (nrow(imp_combined) == 0) {
+    cat("No XGBoost results available for Steps + Static.")
+  } else {
+    ggplot(imp_combined, aes(x = Gain, y = Feature_ord, fill = Category)) +
+      geom_col(width = 0.7) +
+      geom_text(aes(label = round(Gain * 100, 2)), hjust = -0.1, size = 2.5) +
+      scale_fill_brewer(palette = "Set2", name = "Feature category") +
+      scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+      y_scale_xgb +
+      facet_wrap(~juncture_label, ncol = 2, scales = "free_y") +
+      labs(
+        title = "",
+        x     = "Gain (fraction of total information gain)",
+        y     = NULL
+      ) +
+      theme_science() +
+      theme(
+        axis.text.y     = element_text(size = 8),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 8),
+        legend.title    = element_text(size = 8),
+        plot.title      = element_text(size = 9),
+        strip.text      = element_text(size = 9, face = "bold")
+      ) -> p_xgb_imp
+    ggsave(file.path(out_figures, "s2_Figure_5_XGBoost_feature_importance.png"),
+           plot = p_xgb_imp, width = 9, height = 8, dpi = 300, bg = "white")
+    p_xgb_imp
+  }
+```
+
+---
+
+## Figure 6. Logistic Regression Coefficients: Steps + Static Model
+
+```{r fig5-logistic-coefs, echo=FALSE, fig.height=8, fig.cap="Figure 6. Top 20 elastic netÃ¢â‚¬"regularized logistic regression coefficients (OR scale, per 1 SD for continuous predictors): Steps + Static, 14-Day and 30-Day Horizons. Colored by feature category (Set2 palette). These are penalized estimates and should be interpreted as directional associations reflecting relative feature importance within the model, not formal hypothesis tests."}
+
+# Load pre-computed logistic coefficients
+# m2_log_coefs is already loaded from load-precomputed chunk
+
+coef_input <- m2_log_coefs %>%
+  filter(feature_mode == "model3_steps_and_static",
+         term != "(Intercept)", !is.na(odds_ratio))
+
+if (nrow(coef_input) > 0) {
+
+  coef_combined <- coef_input %>%
+    group_by(horizon) %>%
+    arrange(desc(abs(statistic))) %>%
+    slice_head(n = 20) %>%
+    ungroup() %>%
+    mutate(
+      juncture_label = factor(juncture, levels = juncture_labels_vec),
+      Category      = classify_feature(term),
+      Feature_label = apply_feat_labels(term),
+      or_label      = sprintf("%.3f", odds_ratio)
+    )
+
+  #  Save full logistic coefficient table (both horizons) to xlsx 
+  log_all_coef <- m2_log_coefs %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      Juncture = juncture,
+      Category      = classify_feature(term),
+      Feature_label = apply_feat_labels(term)
+    ) %>%
+    arrange(Juncture, desc(abs(estimate))) %>%
+    select(Juncture, Feature_label, Feature_raw = term, Category,
+           Log_Odds = estimate, SE = std.error, Z = statistic,
+           P_value = p.value, Odds_Ratio = odds_ratio)
+  writexl::write_xlsx(log_all_coef, file.path(out_data, "s2_logistic_coefficients_junctures.xlsx"))
+
+  # Per-facet y-axis ordering
+  if (requireNamespace("tidytext", quietly = TRUE)) {
+    coef_combined <- coef_combined %>%
+      mutate(Feature_ord = tidytext::reorder_within(Feature_label, abs(estimate), juncture_label))
+    y_scale_log <- tidytext::scale_y_reordered()
+  } else {
+    coef_combined <- coef_combined %>%
+      mutate(Feature_ord = reorder(Feature_label, abs(estimate)))
+    y_scale_log <- scale_y_discrete()
+  }
+
+  if (nrow(coef_combined) == 0) {
+    cat("No logistic results available for Steps + Static.")
+  } else {
+    ggplot(coef_combined,
+           aes(x = odds_ratio, y = Feature_ord, color = Category)) +
+      geom_vline(xintercept = 1, linetype = "dashed", colour = "grey40", linewidth = 0.5) +
+      geom_point(size = 2) +
+      geom_text(aes(label = or_label), hjust = -0.25, size = 2.5, color = "black") +
+      scale_color_brewer(palette = "Set2", name = "Feature category") +
+      scale_x_continuous(limits = c(0.75, 1.75), expand = expansion(mult = c(0.02, 0.08))) +
+      y_scale_log +
+      facet_wrap(~juncture_label, ncol = 2, scales = "free_y") +
+      labs(
+        title = "",
+        x     = "Regularized coefficient (OR scale, per 1 SD for continuous predictors)",
+        y     = NULL
+      ) +
+      theme_science() +
+      theme(
+        axis.text.y     = element_text(size = 8),
+        legend.position = "bottom",
+        legend.text     = element_text(size = 8),
+        legend.title    = element_text(size = 8),
+        plot.title      = element_text(size = 9),
+        strip.text      = element_text(size = 9, face = "bold")
+      ) -> p_log_coef
+    ggsave(file.path(out_figures, "s2_Figure_6_Logistic_OR_coefficients.png"),
+           plot = p_log_coef, width = 9, height = 8, dpi = 300, bg = "white")
+    p_log_coef
+  }
+} # end if (nrow(coef_input) > 0)
+```
+
+*Note: Coefficients are elastic netÃ¢â‚¬"penalized estimates (glmnet, Steps + Static model). Penalization shrinks estimates toward zero and the plot carries no inferential standard errors or significance thresholds; values reflect the direction and relative magnitude of each feature's contribution within the regularized model. A full coefficient table is saved to `logistic_coefficients_14d_30d.xlsx`.*
+
+---
+
+*Analysis completed: `r format(Sys.time(), "%Y-%m-%d %H:%M")`*  
+*Seed: 2026 | R version: `r R.version$version.string`*
+
+
+
+
+

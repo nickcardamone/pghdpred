@@ -68,12 +68,12 @@ setwd(
 )
 
 # Cohort: contains PatientICN and upload window variables (e.g. date_first)
-cohort = open_dataset('data\\pghd_final_full_visits_ids.parquet') %>% collect() %>% na.omit()
+cohort = open_dataset('data\\input\\pghd_final_full_visits_ids.parquet') %>% collect() %>% na.omit()
 
 # ---------------------------------------------------------------------------
 # M2 anchor: load index events for patients with qualifying ED/IP event
 # ---------------------------------------------------------------------------
-index_events_m2 <- open_dataset('data\\index_event_prelim.parquet') %>%
+index_events_m2 <- open_dataset('data\\input\\index_event_prelim.parquet') %>%
   collect() %>%
   filter(!is.na(index_date)) %>%
   select(PatientICN, index_date) %>%
@@ -342,7 +342,7 @@ get_prior_year_trajectory <- function(data, value_col, patient_col = "PatientICN
       measurement_number = row_number(),
       total_measurements = n()
     ) %>%
-    filter(total_measurements >= 3) %>%  # Require at least 3 measurements for spline
+    filter(total_measurements >= 1) %>%  # Keep all patients; sparse ones fall back to raw stats
     ungroup() %>%
     select(!!sym(patient_col), days_before_index, MEASUREMENT_DATE, !!sym(value_col), 
            measurement_number, total_measurements)
@@ -356,14 +356,14 @@ get_five_year_trajectory <- function(data, value_col, patient_col = "PatientICN"
     # Average multiple measurements on the same day
     group_by(!!sym(patient_col), MEASUREMENT_DATE, days_before_index) %>%
     summarise(!!sym(value_col) := mean(!!sym(value_col), na.rm = TRUE), .groups = 'drop') %>%
-    # Now group by patient and filter for those with 3+ measurement days
+    # Now group by patient and filter for those with 1+ measurement days
     group_by(!!sym(patient_col)) %>%
     arrange(days_before_index) %>%
     mutate(
       measurement_number = row_number(),
       total_measurements = n()
     ) %>%
-    filter(total_measurements >= 3) %>%  # Require at least 3 measurements for spline
+    filter(total_measurements >= 1) %>%  # Keep all patients; sparse ones fall back to raw stats
     ungroup() %>%
     select(!!sym(patient_col), days_before_index, MEASUREMENT_DATE, !!sym(value_col), 
            measurement_number, total_measurements)
@@ -421,95 +421,78 @@ cat("Average timespan (days):", round(mean(map_traj_summary$timespan_days), 0), 
 
 # Function to fit spline and extract summary stats for each patient
 fit_spline_summary <- function(trajectory_data, value_col) {
-  
-  # Fit spline for each patient and extract summary statistics
-  spline_summaries <- trajectory_data %>%
-    group_by(PatientICN) %>%
-    summarise(
-      n_measurements = n(),
-      timespan_days = max(days_before_index) - min(days_before_index),
-      
-      # Raw value statistics
-      value_min = min(!!sym(value_col)),
-      value_max = max(!!sym(value_col)),
-      value_mean = mean(!!sym(value_col)),
-      value_sd = sd(!!sym(value_col)),
-      value_range = max(!!sym(value_col)) - min(!!sym(value_col)),
-      
-      # First and last measurements (chronologically correct)
-      value_first = {
-        data <- cur_data()
-        data[[value_col]][which.max(data$days_before_index)]  # Oldest (furthest back)
+  ns <- splines::ns  # bind locally so formula environment can resolve ns()
+
+  # --- (A) Non-spline statistics ---
+  base_stats <- trajectory_data %>%
+    dplyr::group_by(PatientICN) %>%
+    dplyr::summarise(
+      n_measurements = dplyr::n(),
+      timespan_days  = max(days_before_index) - min(days_before_index),
+      value_min      = min(!!sym(value_col)),
+      value_max      = max(!!sym(value_col)),
+      value_mean     = mean(!!sym(value_col)),
+      value_sd       = sd(!!sym(value_col)),
+      value_range    = max(!!sym(value_col)) - min(!!sym(value_col)),
+      value_first    = {
+        d <- dplyr::pick(dplyr::everything())
+        d[[value_col]][which.max(d$days_before_index)]
       },
-      value_last = {
-        data <- cur_data()
-        data[[value_col]][which.min(data$days_before_index)]  # Most recent (closest to index)
+      value_last     = {
+        d <- dplyr::pick(dplyr::everything())
+        d[[value_col]][which.min(d$days_before_index)]
       },
-      
-      # Calculate slope (change over time)
-      slope = {
-        data <- cur_data()
-        ts <- max(data$days_before_index) - min(data$days_before_index)
-        if(ts > 0) {
-          (data[[value_col]][which.min(data$days_before_index)] - 
-             data[[value_col]][which.max(data$days_before_index)]) / ts * 365
-        } else {
-          NA_real_
-        }
+      slope          = {
+        d  <- dplyr::pick(dplyr::everything())
+        ts <- max(d$days_before_index) - min(d$days_before_index)
+        if (ts > 0)
+          (d[[value_col]][which.min(d$days_before_index)] -
+           d[[value_col]][which.max(d$days_before_index)]) / ts * 365
+        else NA_real_
       },
-      
-      # Fit natural spline with 3 df and extract fitted values
-      spline_fit = list({
-        data <- cur_data()
-        if(nrow(data) >= 3) {
-          tryCatch({
-            # Fit natural spline
-            spline_model <- lm(reformulate("ns(days_before_index, df = 3)", value_col), 
-                               data = data)
-            
-            # Extract fitted values
-            fitted_vals <- fitted(spline_model)
-            
-            # Get fitted values at specific time points (by index in sorted data)
-            fitted_first_idx <- which.max(data$days_before_index)  # Oldest
-            fitted_last_idx <- which.min(data$days_before_index)   # Most recent
-            
-            # Return summary of fitted values
-            list(
-              fitted_min = min(fitted_vals),
-              fitted_max = max(fitted_vals),
-              fitted_mean = mean(fitted_vals),
-              fitted_sd = sd(fitted_vals),
-              fitted_range = max(fitted_vals) - min(fitted_vals),
-              fitted_first = fitted_vals[fitted_first_idx],  # Fitted value at oldest measurement
-              fitted_last = fitted_vals[fitted_last_idx]      # Fitted value at most recent measurement
-            )
-          }, error = function(e) {
-            list(fitted_min = NA, fitted_max = NA, fitted_mean = NA, 
-                 fitted_sd = NA, fitted_range = NA, fitted_first = NA, fitted_last = NA)
-          })
-        } else {
-          list(fitted_min = NA, fitted_max = NA, fitted_mean = NA, 
-               fitted_sd = NA, fitted_range = NA, fitted_first = NA, fitted_last = NA)
-        }
-      }),
-      .groups = 'drop'
+      .groups = "drop"
     )
-  
-  # Unnest the spline fit results
-  spline_summaries <- spline_summaries %>%
-    mutate(
-      fitted_min = sapply(spline_fit, function(x) x$fitted_min),
-      fitted_max = sapply(spline_fit, function(x) x$fitted_max),
-      fitted_mean = sapply(spline_fit, function(x) x$fitted_mean),
-      fitted_sd = sapply(spline_fit, function(x) x$fitted_sd),
-      fitted_range = sapply(spline_fit, function(x) x$fitted_range),
-      fitted_first = sapply(spline_fit, function(x) x$fitted_first),
-      fitted_last = sapply(spline_fit, function(x) x$fitted_last)
-    ) %>%
-    select(-spline_fit)
-  
-  return(spline_summaries)
+
+  # --- (B) Spline statistics via group_modify (data passed explicitly) ---
+  # Avoids cur_data() / list({}) interaction that silently returns empty frames
+  # in dplyr >= 1.1.0 and causes all fitted_* to be NA.
+  spline_stats <- trajectory_data %>%
+    dplyr::group_by(PatientICN) %>%
+    dplyr::group_modify(function(d, key) {
+      n_uniq <- length(unique(d$days_before_index))
+      na_row <- tibble::tibble(
+        fitted_min = NA_real_, fitted_max  = NA_real_, fitted_mean  = NA_real_,
+        fitted_sd  = NA_real_, fitted_range = NA_real_,
+        fitted_first = NA_real_, fitted_last = NA_real_
+      )
+      if (nrow(d) < 4L || n_uniq < 2L) return(na_row)
+      df_ns <- min(3L, n_uniq - 1L)
+      tryCatch({
+        f   <- as.formula(
+          paste0(value_col, " ~ ns(days_before_index, df = ", df_ns, ")"),
+          env = environment()          # environment() has ns in its parent chain
+        )
+        mod <- lm(f, data = d)
+        fv  <- fitted(mod)
+        tibble::tibble(
+          fitted_min   = min(fv),
+          fitted_max   = max(fv),
+          fitted_mean  = mean(fv),
+          fitted_sd    = sd(fv),
+          fitted_range = max(fv) - min(fv),
+          fitted_first = fv[which.max(d$days_before_index)],
+          fitted_last  = fv[which.min(d$days_before_index)]
+        )
+      }, error = function(e) na_row)
+    }) %>%
+    dplyr::ungroup()
+
+  dplyr::left_join(base_stats, spline_stats, by = "PatientICN") %>%
+    # For patients with < 3 measurements, spline fitted_* are NA; fall back to raw equivalents
+    dplyr::mutate(
+      fitted_mean = dplyr::coalesce(fitted_mean, value_mean),
+      fitted_last = dplyr::coalesce(fitted_last, value_last)
+    )
 }
 # Fit splines and extract summary statistics for BMI
 bmi_spline_summary <- fit_spline_summary(bmi_trajectory_5yr, "bmi")

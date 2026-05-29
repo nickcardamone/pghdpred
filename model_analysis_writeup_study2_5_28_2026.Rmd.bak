@@ -1,4 +1,4 @@
----
+﻿---
 title: "Patient-Generated Health Data as a Predictor of Adverse Outcomes in Veterans"
 subtitle: "Study 2 - Post-Discharge PGHD Cohort"
 author: "Nick Cardamone"
@@ -124,6 +124,7 @@ cohort_colors <- c(
   "ED" = "#d73027",
   "Inpatient" = "#4575b4"
 )
+juncture_labels_vec <- c("Wk01", "Wk02", "Wk03", "Wk04")
 feat_labels <- c(
   model1_steps_only       = "Steps only",
   model2_static_only      = "Static only",
@@ -345,17 +346,18 @@ feat_display_names <- c(
   gender_Female                = "Female (Male)",
   gender_Unknown               = "Unknown Sex (Male)",
   # Race (ref = White)
-  race_Black                   = "Black or African American (White)",
-  race_AI_AN                   = "American Indian or Alaska Native (White)",
+  race_BlackOrAfricanAmerican  = "Black or African American (White)",
+  race_AmericanIndian          = "American Indian or Alaska Native (White)",
   race_Asian                   = "Asian (White)",
-  race_PI                      = "Native Hawaiian or Pacific Islander (White)",
+  race_PacificIslander         = "Native Hawaiian or Pacific Islander (White)",
+  race_Multiracial             = "Multiracial (White)",
   race_Unknown                 = "Unknown Race (White)",
   # Ethnicity (ref = Not Hispanic or Latino)
-  eth_Hispanic                 = "Hispanic or Latino (Not Hispanic or Latino)",
+  eth_HispanicOrLatino         = "Hispanic or Latino (Not Hispanic or Latino)",
   eth_Unknown                  = "Unknown Ethnicity (Not Hispanic or Latino)",
   # Marital status (ref = Married)
   marital_Divorced             = "Divorced (Married)",
-  marital_Never                = "Never Married (Married)",
+  marital_NeverMarried         = "Never Married (Married)",
   marital_Widowed              = "Widowed (Married)",
   marital_Separated            = "Separated (Married)",
   marital_Unknown              = "Unknown Marital Status (Married)",
@@ -378,7 +380,6 @@ feat_display_names <- c(
   season_Summer                = "Summer (Fall)",
   season_Winter                = "Winter (Fall)",
   days_obs_remaining           = "Days remaining in follow-up",
-  index_event_type_Inpatient   = "Index visit: Inpatient (ref = ED)",
   # Healthcare utilization
   py_ed                        = "ED visit, prior year",
   py_urgent                    = "Urgent care visit, prior year",
@@ -596,11 +597,10 @@ write_parquet(pd_daily_feats, file.path(out_output, "pd_daily_feats.parquet"))
 rm(pd_dt, pd_daily, pghd_raw); gc()
 ```
 
-```{r build-weeks-m2, include = FALSE, eval = FALSE}
+```{r build-junctures-m2, include = FALSE, eval = FALSE}
 # 
-# STUDY 2 WEEKLY SNAPSHOT PIPELINE — weeks 1 through floor(max_pd_window/7) post-discharge
-# Outcomes labeled; rows censored after first event.
-# Static features joined; CONSORT + patient_summary saved.
+# STUDY 2 JUNCTURE PIPELINE  snapshots at Wk01--Wk04
+# Outcomes labeled, static features joined, CONSORT + patient_summary saved
 # 
 pd_daily_feats   <- open_dataset(file.path(out_output, "pd_daily_feats.parquet")) %>% collect()
 cohort_static_m2 <- open_dataset(file.path(out_output, "cohort_static_m2.parquet")) %>% collect()
@@ -618,23 +618,19 @@ if (!exists("index_events")) {
     filter(discharge_date >= inception_cutoff_m2, discharge_date <= followup_cutoff)
 }
 
-# Weekly snapshot days: weeks 1 through floor(max_pd_window/7) post-discharge
-week_days_vec <- seq(7L, max_pd_window, by = 7L)
+juncture_days_vec <- c(Wk01 = 7L, Wk02 = 14L, Wk03 = 21L, Wk04 = 28L)
 
-# Take snapshot: last valid step row at or before each week cutoff
-weeks_raw <- purrr::imap(
-  setNames(week_days_vec, seq_along(week_days_vec)),
-  function(cutoff_day, week_num) {
-    pd_daily_feats %>%
-      filter(days_post_discharge <= cutoff_day, !is.na(k_steps_7d_avg)) %>%
-      group_by(PatientICN, discharge_date) %>%
-      slice_max(days_post_discharge, n = 1L, with_ties = FALSE) %>%
-      ungroup() %>%
-      mutate(week = as.integer(week_num),
-             snapshot_date = discharge_date + cutoff_day)
-  }) %>% bind_rows()
+#  Take juncture snapshot: last valid step row at or before cutoff day 
+junc_raw <- purrr::imap(juncture_days_vec, function(cutoff_day, junc_label) {
+  pd_daily_feats %>%
+    filter(days_post_discharge <= cutoff_day, !is.na(k_steps_7d_avg)) %>%
+    group_by(PatientICN, discharge_date) %>%
+    slice_max(days_post_discharge, n = 1L, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(juncture = junc_label, juncture_date = discharge_date + cutoff_day)
+}) %>% bind_rows()
 
-# Y: event in (snapshot_date, snapshot_date + outcome_horizon]
+#  Y_30d: event in (juncture_date, juncture_date + outcome_horizon] 
 if (!exists("hcu_events")) {
   hcu_dts <- open_dataset(file.path(data_dir, "hcu_events_daily.parquet")) %>%
     filter(PatientICN %in% unique(index_events$PatientICN)) %>%
@@ -657,20 +653,17 @@ first_event_after <- index_events %>%
   group_by(PatientICN, discharge_date) %>%
   summarise(first_event_date = min(date, na.rm = TRUE), .groups = "drop")
 
-weeks_labeled <- weeks_raw %>%
+junc_labeled <- junc_raw %>%
   left_join(first_event_after, by = c("PatientICN", "discharge_date")) %>%
   mutate(
     days_to_first_event = as.integer(
-      as.Date(first_event_date) - as.Date(snapshot_date)),
-    days_to_event = days_to_first_event,  # alias used by model-fitting
+      as.Date(first_event_date) - as.Date(juncture_date)),
     Y_30d = as.integer(
       !is.na(first_event_date) &
       days_to_first_event >= 1L &
       days_to_first_event <= outcome_horizon),
     Y = Y_30d
-  ) %>%
-  # CENSOR: drop week rows after the first event has occurred
-  filter(is.na(days_to_first_event) | days_to_first_event >= 1L)
+  )
 
 #  Manual dummy encoding for static features 
 add_dummies_m2 <- function(df) {
@@ -715,13 +708,8 @@ add_dummies_m2 <- function(df) {
     mst_Yes            = as.integer(toupper(as.character(mst_status)) == "YES"),
     current_smoker     = as.integer(tolower(as.character(tobacco_status)) == "current smoker"),
     never_smoker       = as.integer(tolower(as.character(tobacco_status)) == "never smoker"),
-    # Season (ref = Fall; based on snapshot_date)
-    .mo               = lubridate::month(snapshot_date),
-    season_Spring     = as.integer(.mo %in% 3:5),
-    season_Summer     = as.integer(.mo %in% 6:8),
-    season_Winter     = as.integer(.mo %in% c(12L, 1L, 2L)),
     index_event_type_Inpatient = as.integer(index_event_type == "Inpatient")
-  ) %>% select(-.pg_num, -.mo)
+  ) %>% select(-.pg_num)
 }
 
 # Static columns available in cohort_static_m2
@@ -734,23 +722,23 @@ static_join_cols <- intersect(
     names(health_fac)[names(health_fac) != "PatientICN"]),
   names(cohort_static_m2))
 
-weeks_full <- weeks_labeled %>%
+junc_full <- junc_labeled %>%
   left_join(cohort_static_m2 %>% select(all_of(static_join_cols)), by = "PatientICN") %>%
   add_dummies_m2()
 
-weeks_all <- weeks_full
-weeks_ed  <- weeks_full %>% filter(index_event_type == "ED")
-weeks_inp <- weeks_full %>% filter(index_event_type == "Inpatient")
+junc_all <- junc_full
+junc_ed  <- junc_full %>% filter(index_event_type == "ED")
+junc_inp <- junc_full %>% filter(index_event_type == "Inpatient")
 
-write_parquet(weeks_all, file.path(out_output, "weeks_all.parquet"))
-write_parquet(weeks_ed,  file.path(out_output, "weeks_ed.parquet"))
-write_parquet(weeks_inp, file.path(out_output, "weeks_inp.parquet"))
+write_parquet(junc_all, file.path(out_output, "junc_all.parquet"))
+write_parquet(junc_ed,  file.path(out_output, "junc_ed.parquet"))
+write_parquet(junc_inp, file.path(out_output, "junc_inp.parquet"))
 
-# CONSORT counts
+#  CONSORT counts 
 n2_pts     <- n_distinct(pd_daily_feats$PatientICN[pd_daily_feats$has_upload == 1L])
-n3_pts     <- n_distinct(weeks_all$PatientICN[weeks_all$week == 1L])
-n3_pts_ed  <- n_distinct(weeks_ed$PatientICN[weeks_ed$week  == 1L])
-n3_pts_inp <- n_distinct(weeks_inp$PatientICN[weeks_inp$week == 1L])
+n3_pts     <- n_distinct(junc_all$PatientICN[junc_all$juncture == "Wk01"])
+n3_pts_ed  <- n_distinct(junc_ed$PatientICN[junc_ed$juncture  == "Wk01"])
+n3_pts_inp <- n_distinct(junc_inp$PatientICN[junc_inp$juncture == "Wk01"])
 
 tibble(n0_pts   = n0_pts,   n0_evts = n0_evts,
        n1_pts   = n1_pts,   n1_evts = n1_evts,
@@ -811,12 +799,12 @@ tibble(
 
 ```{r train-test-m2, eval = FALSE}
 # 
-# TRAIN / TEST SPLIT patient-level 70/30, shared across all cohorts/weeks
+# TRAIN / TEST SPLIT patient-level 70/30, shared across all cohorts/junctures
 # 
-weeks_all <- open_dataset(file.path(out_output, "weeks_all.parquet")) %>% collect()
+junc_all <- open_dataset(file.path(out_output, "junc_all.parquet")) %>% collect()
 
 set.seed(2026L)
-all_pts_m2   <- unique(weeks_all$PatientICN)
+all_pts_m2   <- unique(junc_all$PatientICN)
 train_pts_m2 <- sample(all_pts_m2, floor(0.7 * length(all_pts_m2)))
 test_pts_m2  <- setdiff(all_pts_m2, train_pts_m2)
 
@@ -837,18 +825,13 @@ static_cols_m2_base <- c(
   "marital_Divorced","marital_Never","marital_Widowed","marital_Separated","marital_Unknown",
   "gisurh_Rural","gisurh_HighlyRural","gisurh_Insular","gisurh_Unknown",
   "pg_G2","pg_G3","pg_G4","pg_G5","pg_G6","pg_G7","pg_G8","pg_Unknown",
-  "season_Spring","season_Summer","season_Winter",
   "cci_score",
   "py2_acute_renal_failure","py2_congestive_heart_failure","py2_drug_alcohol_dependence",
   "py2_lung_severe_cancers","py2_metastatic_cancer","py2_heart_arrhythmias",
   "py2_dialysis_status","py2_inpat_any","py2_inpat_med_surg","py2_inpat_mental_health",
-  "py_ed","py_urgent","py_appt_no_show",
-  "bmi_fitted_mean","bmi_slope","bmi_fitted_last",
-  "map_fitted_mean","map_slope","map_fitted_last",
-  "recent_pulse",
-  "bun_value_mean","bun_value_last",
-  "albumin_value_mean","albumin_value_last",
-  "leuk_value_mean","leuk_value_last",
+  "py_ed","py_urgent",
+  "bmi_fitted_mean","map_fitted_mean","recent_pulse",
+  "bun_value_mean","albumin_value_mean","leuk_value_mean",
   "mst_Yes","current_smoker","never_smoker")
 
 static_cols_m2_all    <- c(static_cols_m2_base, "index_event_type_Inpatient")
@@ -857,14 +840,14 @@ static_cols_by_cohort <- list(
   ED        = static_cols_m2_base,
   Inpatient = static_cols_m2_base)
 
-#  Missingness table (all week-rows: row-level and person-level)
-keep_check <- intersect(c(step_cols_m2, static_cols_m2_all), names(weeks_all))
+#  Missingness table (across all junctures "” row-level and person-level)
+keep_check <- intersect(c(step_cols_m2, static_cols_m2_all), names(junc_all))
 
 miss_tbl_m2 <- {
-  feat_data <- weeks_all %>% select(PatientICN, all_of(keep_check))
+  feat_data <- junc_all %>% select(PatientICN, all_of(keep_check))
   feat_cols  <- keep_check
 
-  row_miss <- feat_data %>%
+  junc_miss <- feat_data %>%
     select(all_of(feat_cols)) %>%
     summarise(across(everything(), ~ mean(is.na(.)))) %>%
     pivot_longer(everything(), names_to = "Feature", values_to = "pct_missing_week")
@@ -876,7 +859,7 @@ miss_tbl_m2 <- {
     summarise(across(everything(), ~ mean(.))) %>%
     pivot_longer(everything(), names_to = "Feature", values_to = "pct_missing_person")
 
-  left_join(row_miss, person_miss, by = "Feature") %>%
+  left_join(junc_miss, person_miss, by = "Feature") %>%
     mutate(
       pct_missing_week   = round(pct_missing_week   * 100, 1),
       pct_missing_person = round(pct_missing_person * 100, 1)
@@ -905,13 +888,13 @@ kbl_miss <- miss_tbl %>%
   gt(groupname_col = "category") %>%
   cols_label(
     label              = "Feature",
-    pct_missing_week   = "Weeks Missing (%)",
+    pct_missing_week   = "Junctures Missing (%)",
     pct_missing_person = "Patients Missing (%)"
   ) %>%
   tab_header(title = html(paste0(
     "Table S1. Missingness rates before imputation. ",
-    "\u2018Weeks Missing\u2019: % of week-rows with a missing value. ",
-    "\u2018Patients Missing\u2019: % of patients with \u22651 missing week-row for that feature."
+    "\u2018Junctures Missing\u2019: % of juncture rows (across Wk01\u2013Wk04) with a missing value. ",
+    "\u2018Patients Missing\u2019: % of patients with \u22651 missing juncture for that feature."
   ))) %>%
   cols_align(align = "left",  columns = label) %>%
   cols_align(align = "right", columns = c(pct_missing_week, pct_missing_person)) %>%
@@ -928,12 +911,11 @@ kbl_miss
 
 ```{r model-fitting-m2, eval = FALSE}
 # FIT 12 MODELS: 3 feature sets x 2 horizons x 2 algorithms
-# All post-discharge week-rows are eligible; each week-row carries
-# its own days_to_event so Y is computed dynamically per snapshot.
-# week (1-12) is always included as a feature.
+# Uses Wk04 snapshot (maximum post-discharge PGHD accumulation).
+# Y is computed dynamically so both 14d and 30d horizons share the same features.
 
-weeks_df <- open_dataset(file.path(out_output, "weeks_all.parquet")) %>%
-  collect()
+junc_wk04 <- open_dataset(file.path(out_output, "junc_all.parquet")) %>%
+  filter(juncture == "Wk04") %>% collect()
 
 train_pts_m2 <- open_dataset(file.path(out_output, "train_pts_m2.parquet")) %>%
   collect() %>% pull(PatientICN)
@@ -941,7 +923,7 @@ test_pts_m2  <- open_dataset(file.path(out_output, "test_pts_m2.parquet")) %>%
   collect() %>% pull(PatientICN)
 
 fit_m2_one <- function(feature_mode, horizon, model_type,
-                       df_in = weeks_df) {
+                       df_in = junc_wk04) {
   message(sprintf("\n[fit_m2_one] %-30s | %2dd | %s", feature_mode, horizon, model_type))
 
   avail_step   <- intersect(step_cols_m2,       names(df_in))
@@ -1167,19 +1149,23 @@ write_parquet(m2_cal_data, file.path(out_output, "m2_cal_data.parquet"))
 ```
 
 ```{r sensitivity-run-m2, eval = FALSE}
-# Sensitivity: stratify by PGHD data completeness (per week-row).
-# clean  : <= 3 missing days that week (>= 4 days with step data)
-# sparse : 4-6 missing days that week (1-3 days with step data)
+# Sensitivity: stratify by PGHD data completeness at Wk04.
+# clean  : <= 3 missing days (>= 4 days with step data)
+# sparse : 4-6 missing days  (1-3 days with step data)
 
-weeks_sa <- open_dataset(file.path(out_output, "weeks_all.parquet")) %>%
-  collect() %>%
-  mutate(
+junc_wk04_sa <- open_dataset(file.path(out_output, "junc_all.parquet")) %>%
+  filter(juncture == "Wk04") %>% collect()
+
+quality_strata <- junc_wk04_sa %>%
+  transmute(
+    PatientICN,
     stratum = if_else(!is.na(k_steps_7d_miss_days) & k_steps_7d_miss_days <= 3L,
                       "clean", "sparse"))
 
 sa_results <- list()
 for (stratum_nm in c("clean","sparse")) {
-  df_s <- weeks_sa %>% filter(stratum == stratum_nm)
+  df_s <- junc_wk04_sa %>%
+    semi_join(quality_strata %>% filter(stratum == stratum_nm), by = "PatientICN")
   for (hz in horizons) {
     df_hz <- df_s %>%
       mutate(Y = calc_y_horizon(days_to_event, hz)) %>%
@@ -1341,13 +1327,13 @@ consort_df <- tribble(
     format(n0_pts,  big.mark = ","), format(n0_evts, big.mark = ","),
   "1. Date filter",
     paste0("Restrict to discharges between ", data_start_date, " and ", followup_cutoff_label,
-           " to allow \u22651 full week of post-discharge observation within the data extract window."),
+           " to allow \u22651 full juncture snapshot within the data extract window."),
     format(n1_pts,  big.mark = ","), format(n1_evts, big.mark = ","),
   "2. PGHD data present post-discharge",
     paste0("\u22651 day with a PGHD step upload in [discharge_date + 1, discharge_date + ", max_pd_window, "]."),
     format(n2_pts,  big.mark = ","), "",
-  "3. \u22651 Week-1 snapshot",
-    paste0("Patient has a valid step snapshot at week 1 post-discharge ",
+  "3. \u22651 Wk01 juncture snapshot",
+    paste0("Patient has a valid step snapshot at the Wk01 post-discharge juncture ",
            "(days 1\u20137 post-discharge with non-missing step rolling average). ",
            "ED: n = ", format(n3_pts_ed, big.mark = ","), "; ",
            "Inpatient: n = ", format(n3_pts_inp, big.mark = ","), "."),
@@ -1378,12 +1364,11 @@ The sections below inspect each CONSORT exclusion step to verify that exclusions
 ```{r consort-diagnostics, include = FALSE, eval = T}
 # CONSORT DIAGNOSTICS - Study 1 diagnostic chunks; not applicable for Study 2.
 # Preserved for reference only.
-weeks_all <- open_dataset(file.path(out_output, "weeks_all.parquet")) %>% collect()
 
 dt_wk  <- open_dataset("data/output/model2_study2/dt_weekly_snapshot.parquet") %>% 
 collect() %>% 
 as.data.table() %>%
-inner_join(weeks_all %>% select(PatientICN) %>% distinct(), by = "PatientICN")
+inner_join(junc_all %>% select(PatientICN) %>% distinct(), by = "PatientICN")
 
 # Distribution of first_upload_date for annotation
 
@@ -1432,7 +1417,7 @@ step2_dist <- dt_s1 %>%
 ```
 
 ```{r, include = FALSE, eval = T}
-# Step 4 Diagnostic: not applicable to Study 2 (post-discharge weekly design)
+# Step 4 Diagnostic: not applicable to Study 2 (post-discharge juncture design)
 # Preserved for reference only.
 
 pre4 <- open_dataset("data/output/model2_study2/dt_analysis_pre_step4.parquet") %>% collect() %>% as.data.table()
@@ -1822,7 +1807,7 @@ pd_labeled_disp <- arrow::open_dataset(
          days_post_discharge <= 90) %>%
   left_join(
     patient_summary_m2 %>%
-      select(PatientICN, discharge_date, first_event_date),
+      select(PatientICN, discharge_date, first_event_date, index_event_type),
     by = c("PatientICN", "discharge_date")
   ) %>%
   mutate(
@@ -1845,11 +1830,9 @@ traj_m2 <- pd_labeled_disp %>%
 p_traj_m2 <- ggplot(traj_m2 %>% filter(!is.na(mean_steps)),
        aes(x = days_post_discharge, y = mean_steps,
            color = outcome_group, fill = outcome_group)) +
-  geom_linerange(aes(ymin = mean_steps - se_steps, ymax = mean_steps + se_steps),
-                 linewidth = 1, alpha = 0.25,
-                 position = position_dodge(width = 1.5)) +
-  geom_point(size = 1.2, alpha = 0.85,
-             position = position_dodge(width = 1.5)) +
+  geom_ribbon(aes(ymin = mean_steps - se_steps, ymax = mean_steps + se_steps),
+              alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.7) +
   scale_color_manual(values = c("Event (30d)" = "#d73027", "No Event" = "#69b3a2"),
                      name = "Outcome") +
   scale_fill_manual( values = c("Event (30d)" = "#d73027", "No Event" = "#69b3a2"),
@@ -1881,7 +1864,7 @@ if (!exists("m2_perf_wide") || nrow(m2_perf_wide) == 0) {
   # Null-model reference rows
   null_row_14 <- m2_summaries %>%
     filter(horizon == 14L) %>%
-    dplyr::slice(1) %>%
+    slice(1) %>%
     transmute(
       feature_label = "Null (event rate)",
       algo          = "--",
@@ -1895,7 +1878,7 @@ if (!exists("m2_perf_wide") || nrow(m2_perf_wide) == 0) {
     )
   null_row_30 <- m2_summaries %>%
     filter(horizon == 30L) %>%
-    dplyr::slice(1) %>%
+    slice(1) %>%
     transmute(
       feature_label = "Null (event rate)",
       algo          = "--",
@@ -2102,10 +2085,11 @@ if (requireNamespace("downloadthis", quietly = TRUE) && nrow(cal_tbl_data) > 0) 
   cal_tbl_data %>%
     mutate(
       feature_label  = recode(feature_mode, !!!feat_labels),
-      algo           = str_to_title(model_type)
+      algo           = str_to_title(model_type),
+      juncture_label = juncture
     ) %>%
     select(
-      feature_label, algo,
+      juncture_label, feature_label, algo,
       prob_bin, n, n_events, mean_predicted, observed_rate
     ) %>%
     downloadthis::download_this(
@@ -2120,9 +2104,9 @@ if (requireNamespace("downloadthis", quietly = TRUE) && nrow(cal_tbl_data) > 0) 
 
 ---
 
-## Figure 4. ROC Curves and AUC Summary: 14-Day and 30-Day Horizons
+## Figure 4. ROC Curves at Wk04 and AUC Trend by Juncture
 
-```{r fig4-roc-m2, echo=FALSE, fig.height=4.8, fig.cap="Figure 4. ROC curves at 30-day horizon for logistic regression and XGBoost across feature sets."}
+```{r fig4-roc-m2, echo=FALSE, fig.height=4.8, fig.cap="Figure 4. ROC curves at 30-day horizon for logistic regression and XGBoost across feature sets (left, center). Right: AUC summary by feature set, horizon (14-day and 30-day), and algorithm."}
 roc_30d <- m2_roc_data_30d %>%
   mutate(
     feature_label = recode(feature_mode, !!!feat_labels),
@@ -2130,24 +2114,53 @@ roc_30d <- m2_roc_data_30d %>%
   )
 
 make_roc_panel <- function(algo_name) {
-  d <- roc_30d %>% filter(algo == algo_name)
+  d     <- roc_30d %>% filter(algo == algo_name)
+  auc_d <- d %>% group_by(feature_label) %>%
+    dplyr::slice(round(dplyr::n() / 2)) %>% ungroup()
   ggplot(d, aes(x = fpr, y = tpr, color = feature_label)) +
     geom_line(linewidth = 0.9) +
     geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey60") +
     scale_color_manual(values = feat_colors, name = "Feature set") +
     scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
     scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+    ggrepel::geom_label_repel(
+      data = auc_d,
+      aes(label = sprintf("AUC = %.3f", auc_val)),
+      size = 2.3, box.padding = 0.25, show.legend = FALSE, segment.size = 0.25
+    ) +
     labs(x = "1 - Specificity", y = "Sensitivity", title = algo_name) +
     theme_science() +
     theme(legend.position = "none")
 }
 
-p_fig4 <- make_roc_panel("Logistic") + make_roc_panel("XGBoost") +
-  plot_layout(ncol = 2, guides = "collect") &
+p_auc_summary <- m2_summaries %>%
+  mutate(
+    feature_label = recode(feature_mode, !!!feat_labels),
+    algo          = dplyr::recode(model_type, xgboost = "XGBoost", logistic = "Logistic"),
+    horizon_label = if_else(horizon == 14L, "14-Day", "30-Day")
+  ) %>%
+  ggplot(aes(x = feature_label, y = auc,
+             color = horizon_label, shape = algo,
+             group = interaction(algo, horizon_label))) +
+  geom_line(linewidth = 0.6, alpha = 0.8) +
+  geom_point(size = 2.5) +
+  scale_y_continuous(limits = c(0.50, 0.95)) +
+  scale_color_manual(values = c("14-Day" = "#e66101", "30-Day" = "#5e3c99"),
+    name = "Horizon") +
+  scale_shape_manual(values = c("Logistic" = 16L, "XGBoost" = 17L),
+    name = "Algorithm") +
+  labs(x = "Feature set", y = "AUC (30% hold-out)",
+       title = "AUC by Feature Set & Horizon") +
+  theme_science() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1),
+        legend.position = "right")
+
+p_fig4 <- make_roc_panel("Logistic") + make_roc_panel("XGBoost") + p_auc_summary +
+  plot_layout(ncol = 3, guides = "collect") &
   theme(legend.position = "bottom")
 
 ggsave(file.path(out_figures, "Figure_4_ROC_30d.png"),
-       plot = p_fig4, width = 8, height = 4.8, dpi = 300, bg = "white")
+       plot = p_fig4, width = 12, height = 4.8, dpi = 300, bg = "white")
 p_fig4
 ```
 
@@ -2184,15 +2197,16 @@ feat_display_names <- c(
   Age                          = "Age (years)",
   gender_Female                = "Female (Male)",
   gender_Unknown               = "Unknown Sex (Male)",
-  race_Black                   = "Black or African American (White)",
-  race_AI_AN                   = "American Indian or Alaska Native (White)",
+  race_BlackOrAfricanAmerican  = "Black or African American (White)",
+  race_AmericanIndian          = "American Indian or Alaska Native (White)",
   race_Asian                   = "Asian (White)",
-  race_PI                      = "Native Hawaiian or Pacific Islander (White)",
+  race_PacificIslander         = "Native Hawaiian or Pacific Islander (White)",
+  race_Multiracial             = "Multiracial (White)",
   race_Unknown                 = "Unknown Race (White)",
-  eth_Hispanic                 = "Hispanic or Latino (Not Hispanic or Latino)",
+  eth_HispanicOrLatino         = "Hispanic or Latino (Not Hispanic or Latino)",
   eth_Unknown                  = "Unknown Ethnicity (Not Hispanic or Latino)",
   marital_Divorced             = "Divorced (Married)",
-  marital_Never                = "Never Married (Married)",
+  marital_NeverMarried         = "Never Married (Married)",
   marital_Widowed              = "Widowed (Married)",
   marital_Separated            = "Separated (Married)",
   marital_Unknown              = "Unknown Marital Status (Married)",
@@ -2212,7 +2226,6 @@ feat_display_names <- c(
   season_Summer                = "Summer (Fall)",
   season_Winter                = "Winter (Fall)",
   days_obs_remaining           = "Days remaining in follow-up",
-  index_event_type_Inpatient   = "Index visit: Inpatient (ref = ED)",
   py_ed                        = "ED visit, prior year",
   py_urgent                    = "Urgent care visit, prior year",
   py_appt_no_show              = "Appointment no-show, prior year",
